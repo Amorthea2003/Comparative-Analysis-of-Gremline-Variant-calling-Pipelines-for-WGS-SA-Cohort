@@ -1,0 +1,200 @@
+#!/bin/bash
+#PBS -N GATK_Chunk
+#PBS -l walltime=96:00:00
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -j oe
+
+set -Eeuo pipefail
+
+module load app/gatk/4.4.0.0
+module load app/samtools/1.20
+module load app/bcftools/1.19
+
+BASE_DIR="${HOME}/Variantcalling/gatk"
+REFERENCE="${HOME}/Variantcalling/reference/hg38.fa"
+
+CHUNK_DIR="${BASE_DIR}/interval_chunks"
+
+SCRATCH_BASE="/stor6/scratch3/27777197"
+COHORT_DIR="${SCRATCH_BASE}/gatk_cohort"
+GENOMICSDB="${COHORT_DIR}/genomicsdb"
+GENOMICSDB_DONE="${COHORT_DIR}/GenomicsDBImport.done"
+
+OUTPUT_DIR="${COHORT_DIR}/output"
+
+TMP_DIR="/tmp/${USER}_gatk_chunk_${PBS_JOBID}"
+
+mkdir -p "${OUTPUT_DIR}" "${TMP_DIR}"
+
+
+# Check CHUNK_ID
+
+
+if [[ -z "${CHUNK_ID:-}" ]]; then
+    echo "ERROR: CHUNK_ID was not supplied."
+    echo "Submit with: qsub -v CHUNK_ID=2 gatk_genotype_chunk.pbs"
+    exit 1
+fi
+
+if ! [[ "${CHUNK_ID}" =~ ^[1-8]$ ]]; then
+    echo "ERROR: CHUNK_ID must be 1-8."
+    exit 1
+fi
+
+CHUNK=$(printf "%02d" "${CHUNK_ID}")
+
+INTERVALS="${CHUNK_DIR}/chunk_${CHUNK}.intervals"
+
+VCF="${OUTPUT_DIR}/gatk_chunk_${CHUNK}.vcf.gz"
+TBI="${VCF}.tbi"
+CSI="${VCF}.csi"
+DONE="${OUTPUT_DIR}/gatk_chunk_${CHUNK}.done"
+LOG="${OUTPUT_DIR}/gatk_chunk_${CHUNK}.log"
+
+exec > >(tee -a "${LOG}") 2>&1
+
+echo "=========================================="
+echo "GATK GenotypeGVCFs - Chunk ${CHUNK}"
+echo "Job ID: ${PBS_JOBID}"
+echo "Start: $(date)"
+echo "=========================================="
+
+
+# Check required files
+
+
+[[ -f "${REFERENCE}" ]] || {
+    echo "ERROR: Reference not found: ${REFERENCE}"
+    exit 1
+}
+
+[[ -f "${REFERENCE}.fai" ]] || {
+    echo "ERROR: Reference index not found."
+    exit 1
+}
+
+[[ -f "${REFERENCE}.dict" ]] || {
+    echo "ERROR: Reference dictionary not found."
+    exit 1
+}
+
+[[ -f "${INTERVALS}" ]] || {
+    echo "ERROR: Interval file not found: ${INTERVALS}"
+    exit 1
+}
+
+[[ -f "${GENOMICSDB_DONE}" ]] || {
+    echo "ERROR: GenomicsDBImport.done not found."
+    exit 1
+}
+
+[[ -d "${GENOMICSDB}" ]] || {
+    echo "ERROR: GenomicsDB workspace not found."
+    exit 1
+}
+
+
+# If already complete, stop
+
+
+if [[ -f "${DONE}" && -s "${VCF}" && ( -s "${TBI}" || -s "${CSI}" ) ]]; then
+    echo "Chunk ${CHUNK} already complete."
+    exit 0
+fi
+
+
+# Remove incomplete previous output
+
+
+if [[ -e "${VCF}" && ! -f "${DONE}" ]]; then
+    echo "Existing incomplete VCF found."
+    echo "Removing old VCF and indexes."
+    rm -f "${VCF}" "${TBI}" "${CSI}"
+fi
+
+
+# Run GenotypeGVCFs
+
+
+echo "Running GenotypeGVCFs..."
+echo "Intervals: ${INTERVALS}"
+echo "Output: ${VCF}"
+
+gatk --java-options "-Xmx56g" \
+    GenotypeGVCFs \
+    -R "${REFERENCE}" \
+    -V "gendb://${GENOMICSDB}" \
+    -L "${INTERVALS}" \
+    -O "${VCF}" \
+    --tmp-dir "${TMP_DIR}"
+
+
+# Create GATK index
+
+
+echo "Creating GATK index..."
+
+gatk IndexFeatureFile \
+    -I "${VCF}"
+
+
+# Create CSI index
+
+
+echo "Creating CSI index..."
+
+bcftools index \
+    --csi \
+    -f \
+    "${VCF}"
+
+
+# Validate output
+
+
+echo "Validating output..."
+
+if [[ ! -s "${VCF}" ]]; then
+    echo "ERROR: VCF is missing or empty."
+    exit 1
+fi
+
+if [[ ! -s "${TBI}" && ! -s "${CSI}" ]]; then
+    echo "ERROR: No VCF index found."
+    exit 1
+fi
+
+SAMPLE_COUNT=$(bcftools query -l "${VCF}" | wc -l)
+
+echo "Sample count: ${SAMPLE_COUNT}"
+
+if [[ "${SAMPLE_COUNT}" -ne 44 ]]; then
+    echo "ERROR: Expected 44 samples, found ${SAMPLE_COUNT}."
+    exit 1
+fi
+
+# Count variant records using bcftools index -n
+VARIANT_COUNT=$(bcftools index -n "${VCF}")
+
+echo "Variant count: ${VARIANT_COUNT}"
+
+if [[ "${VARIANT_COUNT}" -eq 0 ]]; then
+    echo "ERROR: VCF contains zero variants."
+    exit 1
+fi
+
+# Check that at least one variant can be read
+bcftools view -H "${VCF}" | head -n 1 > /dev/null
+
+
+# Mark complete
+
+
+touch "${DONE}"
+
+echo "=========================================="
+echo "Chunk ${CHUNK} COMPLETE"
+echo "Variants: ${VARIANT_COUNT}"
+echo "Samples: ${SAMPLE_COUNT}"
+echo "End: $(date)"
+echo "=========================================="

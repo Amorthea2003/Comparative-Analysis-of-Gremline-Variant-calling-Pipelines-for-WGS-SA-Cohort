@@ -1,0 +1,321 @@
+#!/bin/bash
+#PBS -N GATK_Cohort
+#PBS -l walltime=96:00:00
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -j oe
+
+set -Eeuo pipefail
+
+module load app/gatk/4.4.0.0
+module load app/samtools/1.20
+module load app/bcftools/1.19
+
+# ============================================================
+# GATK COHORT JOINT CALLING
+#
+# 44 individual gVCFs
+#        ↓
+# GenomicsDBImport
+#        ↓
+# GenotypeGVCFs
+#        ↓
+# joint-called VCF
+# ============================================================
+
+BASE_DIR="${HOME}/Variantcalling/gatk"
+REFERENCE="${HOME}/Variantcalling/reference/hg38.fa"
+INTERVALS="${BASE_DIR}/hg38.gatk.intervals"
+
+SCRATCH_BASE="/stor6/scratch3/27777197"
+COHORT_DIR="${SCRATCH_BASE}/gatk_cohort"
+
+GENOMICSDB="${COHORT_DIR}/genomicsdb"
+TMP_DIR="/tmp/${USER}_gatk_cohort_${PBS_JOBID}"
+OUTPUT_DIR="${COHORT_DIR}/output"
+
+SAMPLE_MAP="${COHORT_DIR}/sample_map.txt"
+JOINT_VCF="${OUTPUT_DIR}/gatk_joint.vcf.gz"
+JOINT_TBI="${JOINT_VCF}.tbi"
+
+GENOMICSDB_DONE="${COHORT_DIR}/GenomicsDBImport.done"
+JOINT_DONE="${COHORT_DIR}/GenotypeGVCFs.done"
+
+mkdir -p "${COHORT_DIR}"
+mkdir -p "${TMP_DIR}"
+mkdir -p "${OUTPUT_DIR}"
+
+LOG="${COHORT_DIR}/gatk_cohort.log"
+
+exec > >(tee -a "${LOG}") 2>&1
+
+echo "============================================================"
+echo "GATK COHORT JOINT CALLING"
+echo "Started: $(date)"
+echo "Host: $(hostname)"
+echo "============================================================"
+
+
+# 44 samples
+
+
+SAMPLES=(
+    1001
+    1003
+    1004
+    1005
+    1007
+    1008
+    1009
+    1010
+    1011
+    1013
+    1014
+    1015
+    1017
+    1018
+    1019
+    1020
+    1021
+    1022
+    1023
+    1024
+    1025
+    1026
+    1027
+    1029
+    1032
+    1033
+    1035
+    1036
+    1037
+    1038
+    1041
+    1042
+    1054
+    1060
+    1064
+    1747
+    1756
+    35
+    47
+    549
+    73
+    792
+    899
+    906
+)
+
+echo
+echo "Number of samples: ${#SAMPLES[@]}"
+
+if [[ "${#SAMPLES[@]}" -ne 44 ]]; then
+    echo "ERROR: Expected 44 samples but found ${#SAMPLES[@]}"
+    exit 1
+fi
+
+
+# Check reference
+
+
+echo
+echo "Checking reference..."
+
+if [[ ! -s "${REFERENCE}" ]]; then
+    echo "ERROR: Reference FASTA not found:"
+    echo "${REFERENCE}"
+    exit 1
+fi
+
+if [[ ! -s "${REFERENCE}.fai" ]]; then
+    echo "ERROR: Reference FASTA index not found:"
+    echo "${REFERENCE}.fai"
+    exit 1
+fi
+
+DICT="${REFERENCE%.fa}.dict"
+
+if [[ ! -s "${DICT}" ]]; then
+    echo "ERROR: Reference sequence dictionary not found:"
+    echo "${DICT}"
+    exit 1
+fi
+
+echo "Reference:"
+echo "${REFERENCE}"
+echo "FAI:"
+echo "${REFERENCE}.fai"
+echo "DICT:"
+echo "${DICT}"
+
+
+# Check all 44 gVCFs and indexes
+
+
+echo
+echo "Checking all 44 individual gVCFs..."
+
+rm -f "${SAMPLE_MAP}"
+MISSING=0
+
+for SAMPLE in "${SAMPLES[@]}"; do
+
+    GVCF="${BASE_DIR}/${SAMPLE}/haplotypecaller/${SAMPLE}.g.vcf.gz"
+    TBI="${GVCF}.tbi"
+
+    if [[ ! -s "${GVCF}" ]]; then
+        echo "ERROR: Missing gVCF for ${SAMPLE}:"
+        echo "${GVCF}"
+        MISSING=1
+        continue
+    fi
+
+    if [[ ! -s "${TBI}" ]]; then
+        echo "ERROR: Missing gVCF index for ${SAMPLE}:"
+        echo "${TBI}"
+        MISSING=1
+        continue
+    fi
+
+    printf "%s\t%s\n" "${SAMPLE}" "${GVCF}" >> "${SAMPLE_MAP}"
+
+done
+
+if [[ "${MISSING}" -ne 0 ]]; then
+    echo
+    echo "ERROR: One or more gVCFs/indexes are missing."
+    exit 1
+fi
+
+echo
+echo "All 44 gVCFs and indexes are present."
+
+echo
+echo "Sample map:"
+cat "${SAMPLE_MAP}"
+
+
+# GenomicsDBImport
+
+
+echo
+echo "============================================================"
+echo "STEP 1: GenomicsDBImport"
+echo "============================================================"
+echo "Started: $(date)"
+
+if [[ -s "${GENOMICSDB_DONE}" ]]; then
+
+    echo "GenomicsDBImport already completed."
+    echo "Skipping."
+
+else
+
+    echo "Creating GenomicsDB workspace:"
+    echo "${GENOMICSDB}"
+
+    if [[ -e "${GENOMICSDB}" ]]; then
+        echo
+        echo "ERROR: GenomicsDB workspace already exists but"
+        echo "completion marker is missing:"
+        echo "${GENOMICSDB}"
+        echo
+        echo "The existing workspace will NOT be deleted automatically."
+        echo "Inspect it before rerunning."
+        exit 1
+    fi
+
+    gatk --java-options "-Xmx56g" GenomicsDBImport \
+        --genomicsdb-workspace-path "${GENOMICSDB}" \
+        --sample-name-map "${SAMPLE_MAP}" \
+        --batch-size 50 \
+        --reader-threads 8 \
+        --genomicsdb-shared-posixfs-optimizations \
+        --merge-input-intervals \
+        --tmp-dir "${TMP_DIR}" \
+        -L "${INTERVALS}"
+
+    echo
+    echo "GenomicsDBImport finished."
+
+    touch "${GENOMICSDB_DONE}"
+
+fi
+
+echo
+echo "GenomicsDB workspace:"
+ls -ld "${GENOMICSDB}"
+
+
+# GenotypeGVCFs
+
+
+echo
+echo "============================================================"
+echo "STEP 2: GenotypeGVCFs"
+echo "============================================================"
+echo "Started: $(date)"
+
+if [[ -s "${JOINT_DONE}" && -s "${JOINT_VCF}" && -s "${JOINT_TBI}" ]]; then
+
+    echo "GenotypeGVCFs already completed."
+    echo "Skipping."
+
+else
+
+    gatk --java-options "-Xmx56g" GenotypeGVCFs \
+        -R "${REFERENCE}" \
+        -V "gendb://${GENOMICSDB}" \
+        -O "${JOINT_VCF}" \
+        --tmp-dir "${TMP_DIR}" \
+        -L "${INTERVALS}"
+
+    if [[ ! -s "${JOINT_VCF}" ]]; then
+        echo "ERROR: Joint VCF was not created."
+        exit 1
+    fi
+
+    if [[ ! -s "${JOINT_TBI}" ]]; then
+        echo "ERROR: Joint VCF index was not created."
+        exit 1
+    fi
+
+    touch "${JOINT_DONE}"
+
+fi
+
+
+# Final checks
+
+
+echo
+echo "============================================================"
+echo "FINAL OUTPUT"
+echo "============================================================"
+
+ls -lh "${JOINT_VCF}"
+ls -lh "${JOINT_TBI}"
+
+echo
+echo "Checking VCF header..."
+
+bcftools view -h "${JOINT_VCF}" | head -20
+
+echo
+echo "Checking VCF index..."
+
+bcftools index -n "${JOINT_VCF}"
+
+echo
+echo "============================================================"
+echo "GATK COHORT JOINT CALLING COMPLETED"
+echo "Finished: $(date)"
+echo "============================================================"
+
+echo
+echo "Final joint-called VCF:"
+echo "${JOINT_VCF}"
+
+echo
+echo "Final VCF index:"
+echo "${JOINT_TBI}"
+

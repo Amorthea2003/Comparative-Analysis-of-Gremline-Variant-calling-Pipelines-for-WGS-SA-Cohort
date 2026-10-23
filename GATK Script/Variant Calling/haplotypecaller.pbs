@@ -1,0 +1,442 @@
+#!/bin/bash
+#PBS -N HaplotypeCaller
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -l walltime=48:00:00
+#PBS -M 27777197@sun.ac.za
+#PBS -m abe
+
+set -euo pipefail
+
+
+
+# CHECK SAMPLE
+
+
+if [[ -z "${SAMPLE:-}" ]]; then
+    echo "ERROR: SAMPLE was not specified."
+    echo
+    echo "Submit with:"
+    echo "qsub -v SAMPLE=<sample_id> haplotypecaller.pbs"
+    exit 1
+fi
+
+
+
+# DIRECTORIES
+
+
+BASE_DIR="${HOME}/Variantcalling"
+
+GATK_DIR="${BASE_DIR}/gatk"
+SAMPLE_DIR="${GATK_DIR}/${SAMPLE}"
+
+REFERENCE="${BASE_DIR}/reference/hg38.fa"
+
+BAM="${SAMPLE_DIR}/${SAMPLE}_bqsr.bam"
+BAI="${SAMPLE_DIR}/${SAMPLE}_bqsr.bai"
+
+OUTPUT_DIR="${SAMPLE_DIR}/haplotypecaller"
+
+GVCF="${OUTPUT_DIR}/${SAMPLE}.g.vcf.gz"
+TBI="${GVCF}.tbi"
+CSI="${GVCF}.csi"
+
+DONE="${SAMPLE_DIR}/haplotypecaller.done"
+
+LOG_FILE="${SAMPLE_DIR}/haplotypecaller.log"
+
+
+mkdir -p "${SAMPLE_DIR}"
+mkdir -p "${OUTPUT_DIR}"
+
+
+
+# LOGGING
+
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "${LOG_FILE}"
+}
+
+
+log "============================================================"
+log "STARTING GATK HAPLOTYPECALLER"
+log "============================================================"
+
+log "Sample: ${SAMPLE}"
+log "Node: $(hostname)"
+log "Job ID: ${PBS_JOBID}"
+log "PBS CPUs: ${PBS_NCPUS:-16}"
+
+
+
+# LOAD MODULES
+
+
+log "Loading GATK 4.4.0.0..."
+log "Loading Samtools 1.20..."
+
+module purge
+
+module load app/gatk/4.4.0.0
+module load app/samtools/1.20
+
+hash -r
+
+
+
+# SOFTWARE / ENVIRONMENT CHECK
+
+
+log "============================================================"
+log "SOFTWARE / ENVIRONMENT CHECK"
+log "============================================================"
+
+log "GATK version:"
+gatk --version | tee -a "${LOG_FILE}"
+
+log "Samtools version:"
+samtools --version | head -n 2 | tee -a "${LOG_FILE}"
+
+log "Java version:"
+java -version 2>&1 | tee -a "${LOG_FILE}"
+
+log "Memory:"
+free -h | tee -a "${LOG_FILE}"
+
+
+
+# CHECK REFERENCE
+
+
+log "============================================================"
+log "CHECKING REFERENCE GENOME"
+log "============================================================"
+
+if [[ ! -s "${REFERENCE}" ]]; then
+    log "ERROR: Reference genome not found:"
+    log "${REFERENCE}"
+    exit 1
+fi
+
+if [[ ! -s "${REFERENCE}.fai" ]]; then
+    log "ERROR: FASTA index not found:"
+    log "${REFERENCE}.fai"
+    exit 1
+fi
+
+if [[ ! -s "${BASE_DIR}/reference/hg38.dict" ]]; then
+    log "ERROR: Sequence dictionary not found:"
+    log "${BASE_DIR}/reference/hg38.dict"
+    exit 1
+fi
+
+log "Reference genome: ${REFERENCE}"
+
+
+
+# CHECK WHETHER GVCF ALREADY EXISTS
+
+
+log "============================================================"
+log "CHECKING FOR EXISTING GVCF"
+log "============================================================"
+
+if [[ -s "${GVCF}" && ( -s "${TBI}" || -s "${CSI}" ) ]]; then
+
+    log "EXISTING GVCF FOUND."
+    log "HaplotypeCaller will NOT be rerun."
+    log "Existing GVCF: ${GVCF}"
+
+    ls -lh "${GVCF}" | tee -a "${LOG_FILE}"
+
+    if [[ -s "${TBI}" ]]; then
+        ls -lh "${TBI}" | tee -a "${LOG_FILE}"
+    fi
+
+    if [[ -s "${CSI}" ]]; then
+        ls -lh "${CSI}" | tee -a "${LOG_FILE}"
+    fi
+
+    log "Existing HaplotypeCaller output preserved."
+
+    touch "${DONE}"
+
+    log "Completion marker:"
+    log "${DONE}"
+
+    log "============================================================"
+    log "HAPLOTYPECALLER ALREADY COMPLETE"
+    log "============================================================"
+
+    exit 0
+fi
+
+
+
+# CHECK INPUT BAM
+
+
+log "============================================================"
+log "CHECKING BQSR BAM"
+log "============================================================"
+
+if [[ ! -s "${BAM}" ]]; then
+    log "ERROR: BQSR BAM not found:"
+    log "${BAM}"
+    exit 1
+fi
+
+if [[ ! -s "${BAI}" ]]; then
+    log "ERROR: BQSR BAM index not found:"
+    log "${BAI}"
+    exit 1
+fi
+
+log "Input BAM: ${BAM}"
+
+ls -lh \
+    "${BAM}" \
+    "${BAI}" \
+    | tee -a "${LOG_FILE}"
+
+
+
+# CHECK BAM INTEGRITY
+
+
+log "============================================================"
+log "CHECKING BAM INTEGRITY"
+log "============================================================"
+
+if ! samtools quickcheck -v "${BAM}"; then
+    log "ERROR: BAM integrity check failed."
+    exit 1
+fi
+
+log "BAM integrity check: OK."
+
+
+
+# CHECK BAM HEADER
+
+
+log "============================================================"
+log "CHECKING BAM HEADER"
+log "============================================================"
+
+samtools view -H "${BAM}" | grep "^@RG" | tee -a "${LOG_FILE}"
+
+
+
+# CHECK SAMPLE READ GROUP
+
+
+if ! samtools view -H "${BAM}" | grep -q "SM:${SAMPLE}"; then
+    log "ERROR: SM:${SAMPLE} not found in BAM header."
+    exit 1
+fi
+
+log "BAM sample read group: OK."
+
+
+
+# REMOVE ONLY INCOMPLETE/STALE OUTPUT
+
+
+log "============================================================"
+log "CHECKING FOR INCOMPLETE PREVIOUS OUTPUT"
+log "============================================================"
+
+if [[ -e "${GVCF}" ]]; then
+    log "WARNING: GVCF exists but is missing a valid index."
+    log "GVCF will be regenerated."
+    rm -f "${GVCF}"
+    rm -f "${TBI}"
+    rm -f "${CSI}"
+fi
+
+
+
+# RUN HAPLOTYPECALLER
+
+
+log "============================================================"
+log "RUNNING HAPLOTYPECALLER"
+log "============================================================"
+
+log "GATK version: 4.4.0.0"
+log "Mode: GVCF"
+log "Input BAM: ${BAM}"
+log "Reference: ${REFERENCE}"
+log "Output GVCF: ${GVCF}"
+log "Java heap: 56 GB"
+log "Native Pair-HMM threads: 16"
+
+START_HC=$(date +%s)
+
+gatk --java-options "-Xmx56g" HaplotypeCaller \
+    -R "${REFERENCE}" \
+    -I "${BAM}" \
+    -O "${GVCF}" \
+    -ERC GVCF \
+    --native-pair-hmm-threads 16
+
+END_HC=$(date +%s)
+
+HC_TIME=$((END_HC - START_HC))
+
+log "HaplotypeCaller completed."
+log "HaplotypeCaller runtime: ${HC_TIME} seconds."
+
+
+
+# CHECK GVCF
+
+
+log "============================================================"
+log "CHECKING HAPLOTYPECALLER OUTPUT"
+log "============================================================"
+
+if [[ ! -s "${GVCF}" ]]; then
+    log "ERROR: GVCF was not created."
+    exit 1
+fi
+
+log "GVCF created successfully."
+
+ls -lh "${GVCF}" | tee -a "${LOG_FILE}"
+
+
+
+# INDEX GVCF
+
+
+log "============================================================"
+log "INDEXING GVCF"
+log "============================================================"
+
+gatk IndexFeatureFile \
+    -I "${GVCF}"
+
+
+if [[ -s "${TBI}" ]]; then
+
+    log "GVCF TBI index created:"
+    log "${TBI}"
+
+elif [[ -s "${CSI}" ]]; then
+
+    log "GVCF CSI index created:"
+    log "${CSI}"
+
+else
+
+    log "ERROR: GVCF index was not created."
+    exit 1
+
+fi
+
+
+
+# BASIC GVCF SANITY CHECK
+
+
+log "============================================================"
+log "CHECKING GVCF CONTENT"
+log "============================================================"
+
+if ! zgrep -q '^##fileformat=VCF' "${GVCF}"; then
+    log "ERROR: GVCF does not contain a valid VCF fileformat header."
+    exit 1
+fi
+
+if ! zgrep -q "^#CHROM" "${GVCF}"; then
+    log "ERROR: GVCF does not contain a VCF column header."
+    exit 1
+fi
+
+if ! zgrep -q "^#CHROM.*${SAMPLE}" "${GVCF}"; then
+    log "ERROR: Expected sample ${SAMPLE} not found in GVCF header."
+    exit 1
+fi
+
+log "GVCF content check: OK."
+
+
+
+# VALIDATION
+#
+# ValidateVariants is QC only.
+# It does NOT determine whether HaplotypeCaller succeeded.
+
+
+log "============================================================"
+log "RUNNING GVCF VALIDATION / QC"
+log "============================================================"
+
+VALIDATION_LOG="${OUTPUT_DIR}/${SAMPLE}.validation.log"
+
+set +e
+
+gatk ValidateVariants \
+    -R "${REFERENCE}" \
+    -V "${GVCF}" \
+    > "${VALIDATION_LOG}" 2>&1
+
+VALIDATION_STATUS=$?
+
+set -e
+
+if [[ ${VALIDATION_STATUS} -eq 0 ]]; then
+
+    log "GVCF validation: PASSED."
+
+else
+
+    log "WARNING: GVCF strict validation returned exit status ${VALIDATION_STATUS}."
+    log "This does NOT invalidate the HaplotypeCaller output."
+    log "Validation output saved to:"
+    log "${VALIDATION_LOG}"
+
+fi
+
+
+
+# FINAL OUTPUT CHECK
+
+
+log "============================================================"
+log "FINAL OUTPUT CHECK"
+log "============================================================"
+
+log "Sample: ${SAMPLE}"
+log "Input BAM: ${BAM}"
+log "Output GVCF: ${GVCF}"
+
+ls -lh "${GVCF}" | tee -a "${LOG_FILE}"
+
+if [[ -s "${TBI}" ]]; then
+    ls -lh "${TBI}" | tee -a "${LOG_FILE}"
+fi
+
+if [[ -s "${CSI}" ]]; then
+    ls -lh "${CSI}" | tee -a "${LOG_FILE}"
+fi
+
+
+
+# COMPLETION MARKER
+
+
+touch "${DONE}"
+
+log "============================================================"
+log "HAPLOTYPECALLER COMPLETED SUCCESSFULLY"
+log "============================================================"
+
+log "Sample: ${SAMPLE}"
+log "HaplotypeCaller runtime: ${HC_TIME} seconds"
+log "Completion marker: ${DONE}"
+
+log "============================================================"

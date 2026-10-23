@@ -1,0 +1,66 @@
+#!/bin/bash
+
+#PBS -N index_dedup
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -M 27777197@sun.ac.za
+#PBS -m abe
+
+set -euo pipefail
+
+if [[ -z "${SAMPLE:-}" ]]; then
+    echo "ERROR: SAMPLE not specified"
+    exit 1
+fi
+
+module purge
+module load app/samtools/1.20
+
+BAM="${HOME}/Variantcalling/gatk/${SAMPLE}/${SAMPLE}_dedup.bam"
+BAI="${BAM}.bai"
+
+echo "============================================================"
+echo "Starting deduplicated BAM indexing"
+echo "Sample: ${SAMPLE}"
+echo "BAM: ${BAM}"
+echo "============================================================"
+
+if [[ ! -s "${BAM}" ]]; then
+    echo "ERROR: BAM does not exist or is empty:"
+    echo "${BAM}"
+    exit 1
+fi
+
+if [[ -s "${BAI}" ]]; then
+    echo "BAI already exists:"
+    ls -lh "${BAI}"
+    exit 0
+fi
+
+ls -lh "${BAM}"
+
+echo "Running samtools quickcheck..."
+samtools quickcheck "${BAM}"
+echo "BAM passed quickcheck."
+
+echo "Starting indexing..."
+date
+
+samtools index -@ 8 "${BAM}" "${BAI}"
+
+echo "Indexing completed."
+date
+
+if [[ ! -s "${BAI}" ]]; then
+    echo "ERROR: BAI was not created."
+    exit 1
+fi
+
+echo "============================================================"
+echo "INDEXING SUCCESSFUL"
+echo "Sample: ${SAMPLE}"
+echo "BAM:"
+ls -lh "${BAM}"
+echo "BAI:"
+ls -lh "${BAI}"
+echo "============================================================"

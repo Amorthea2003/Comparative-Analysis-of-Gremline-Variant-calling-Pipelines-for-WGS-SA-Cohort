@@ -1,0 +1,24 @@
+#!/bin/bash
+
+#PBS -N prep_genome
+#PBS -l walltime=48:00:00
+#PBS -m abe
+
+base_dir=$HOME/Variantcalling
+ref_dir=${base_dir}/reference
+
+cd ${ref_dir}
+
+# Create sequence dictionary
+module purge
+module load app/gatk/4.4.6.0
+
+gatk CreateSequenceDictionary \
+    -R hg38.fa \
+    -O hg38.dict
+
+# Create FASTA index
+module purge
+module load app/samtools/1.20
+
+samtools faidx hg38.fa

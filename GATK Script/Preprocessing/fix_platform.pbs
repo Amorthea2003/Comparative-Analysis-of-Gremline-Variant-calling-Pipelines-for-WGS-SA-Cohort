@@ -1,0 +1,66 @@
+#!/bin/bash
+#PBS -N GATK_FixRG
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+
+set -euo pipefail
+
+module load app/gatk/4.4.0.0
+module load app/samtools/1.20
+
+BASE_DIR="$HOME/Variantcalling/gatk"
+SAMPLE="${SAMPLE:?ERROR: SAMPLE not supplied}"
+
+BAM="${BASE_DIR}/${SAMPLE}/${SAMPLE}_dedup.bam"
+NEW_BAM="${BASE_DIR}/${SAMPLE}/${SAMPLE}_dedup_fixed.bam"
+NEW_BAI="${NEW_BAM}.bai"
+LOG="${BASE_DIR}/${SAMPLE}/${SAMPLE}_fixRG.log"
+
+exec > >(tee -a "$LOG") 2>&1
+
+echo "============================================================"
+echo "Fixing read-group platform for sample ${SAMPLE}"
+echo "Started: $(date)"
+echo "============================================================"
+
+if [[ ! -f "$BAM" ]]; then
+    echo "ERROR: BAM not found:"
+    echo "$BAM"
+    exit 1
+fi
+
+echo "Original read group:"
+samtools view -H "$BAM" | grep '^@RG'
+
+echo
+echo "Creating corrected BAM..."
+
+samtools view -H "$BAM" \
+    | sed 's/\tPL:MGI\t/\tPL:DNBSEQ\tPM:MGI\t/' \
+    > "${BASE_DIR}/${SAMPLE}/${SAMPLE}_fixed_header.sam"
+
+samtools reheader \
+    "${BASE_DIR}/${SAMPLE}/${SAMPLE}_fixed_header.sam" \
+    "$BAM" > "$NEW_BAM"
+
+rm -f "${BASE_DIR}/${SAMPLE}/${SAMPLE}_fixed_header.sam"
+
+echo
+echo "Indexing corrected BAM..."
+
+samtools index -@ 4 "$NEW_BAM"
+
+echo
+echo "Corrected read group:"
+samtools view -H "$NEW_BAM" | grep '^@RG'
+
+echo
+echo "Checking files:"
+ls -lh "$NEW_BAM" "$NEW_BAI"
+
+echo
+echo "============================================================"
+echo "Sample ${SAMPLE} completed"
+echo "Finished: $(date)"
+echo "============================================================"

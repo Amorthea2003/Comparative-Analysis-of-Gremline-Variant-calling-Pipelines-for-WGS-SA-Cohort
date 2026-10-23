@@ -1,0 +1,254 @@
+#!/bin/bash
+#PBS -N GATK_Genotype
+#PBS -l walltime=96:00:00
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -j oe
+
+set -Eeuo pipefail
+
+module load app/gatk/4.4.0.0
+module load app/samtools/1.20
+module load app/bcftools/1.19
+
+BASE_DIR="${HOME}/Variantcalling/gatk"
+REFERENCE="${HOME}/Variantcalling/reference/hg38.fa"
+INTERVALS="${BASE_DIR}/hg38.gatk.intervals"
+
+SCRATCH_BASE="/stor6/scratch3/27777197"
+COHORT_DIR="${SCRATCH_BASE}/gatk_cohort"
+
+GENOMICSDB="${COHORT_DIR}/genomicsdb"
+GENOMICSDB_DONE="${COHORT_DIR}/GenomicsDBImport.done"
+
+OUTPUT_DIR="${COHORT_DIR}/output"
+
+JOINT_VCF="${OUTPUT_DIR}/gatk_joint.vcf.gz"
+JOINT_TBI="${JOINT_VCF}.tbi"
+JOINT_DONE="${COHORT_DIR}/GenotypeGVCFs.done"
+
+TMP_DIR="/tmp/${USER}_gatk_genotype_${PBS_JOBID}"
+
+mkdir -p "${COHORT_DIR}"
+mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${TMP_DIR}"
+
+LOG="${COHORT_DIR}/gatk_genotype.log"
+
+exec > >(tee -a "${LOG}") 2>&1
+
+echo "============================================================"
+echo "GATK GENOTYPEGVCFs"
+echo "Started: $(date)"
+echo "Host: $(hostname)"
+echo "PBS Job: ${PBS_JOBID}"
+echo "============================================================"
+
+
+# CHECK REFERENCE
+
+
+echo
+echo "Checking reference..."
+
+if [[ ! -s "${REFERENCE}" ]]; then
+    echo "ERROR: Reference FASTA not found:"
+    echo "${REFERENCE}"
+    exit 1
+fi
+
+if [[ ! -s "${REFERENCE}.fai" ]]; then
+    echo "ERROR: Reference FASTA index not found:"
+    echo "${REFERENCE}.fai"
+    exit 1
+fi
+
+DICT="${REFERENCE%.fa}.dict"
+
+if [[ ! -s "${DICT}" ]]; then
+    echo "ERROR: Reference sequence dictionary not found:"
+    echo "${DICT}"
+    exit 1
+fi
+
+echo "Reference checks passed."
+
+
+# CHECK INTERVALS
+
+
+echo
+echo "Checking intervals..."
+
+if [[ ! -s "${INTERVALS}" ]]; then
+    echo "ERROR: GATK interval file not found:"
+    echo "${INTERVALS}"
+    exit 1
+fi
+
+echo "Intervals:"
+echo "${INTERVALS}"
+
+
+# CHECK COMPLETED GENOMICSDB
+
+
+echo
+echo "============================================================"
+echo "CHECKING GENOMICSDB"
+echo "============================================================"
+
+if [[ ! -f "${GENOMICSDB_DONE}" ]]; then
+    echo "ERROR: GenomicsDBImport.done does not exist."
+    echo
+    echo "GenomicsDBImport is not confirmed as complete."
+    echo "This script will NOT run or rebuild GenomicsDBImport."
+    exit 1
+fi
+
+if [[ ! -d "${GENOMICSDB}" ]]; then
+    echo "ERROR: GenomicsDB workspace does not exist:"
+    echo "${GENOMICSDB}"
+    exit 1
+fi
+
+echo "GenomicsDBImport: COMPLETE"
+echo "GenomicsDB workspace:"
+echo "${GENOMICSDB}"
+echo
+echo "GenomicsDBImport will be SKIPPED."
+
+
+# CHECK IF GENOTYPEGVCFs IS ALREADY COMPLETE
+
+
+echo
+echo "============================================================"
+echo "CHECKING GENOTYPEGVCFs STATUS"
+echo "============================================================"
+
+if [[ -s "${JOINT_DONE}" ]] &&
+   [[ -s "${JOINT_VCF}" ]] &&
+   [[ -s "${JOINT_TBI}" ]]; then
+
+    echo "GenotypeGVCFs is already complete."
+    echo "Joint VCF:"
+    echo "${JOINT_VCF}"
+    echo
+    echo "Skipping GenotypeGVCFs."
+
+else
+
+    echo "GenotypeGVCFs is NOT complete."
+
+    
+    # REMOVE INCOMPLETE OUTPUT FROM PREVIOUS WALLTIME FAILURE
+    
+
+    if [[ -e "${JOINT_VCF}" || -e "${JOINT_TBI}" ]]; then
+
+        echo
+        echo "Incomplete GenotypeGVCFs output detected."
+
+        if [[ -e "${JOINT_VCF}" ]]; then
+            echo "Removing:"
+            echo "${JOINT_VCF}"
+            rm -f "${JOINT_VCF}"
+        fi
+
+        if [[ -e "${JOINT_TBI}" ]]; then
+            echo "Removing:"
+            echo "${JOINT_TBI}"
+            rm -f "${JOINT_TBI}"
+        fi
+
+    fi
+
+    
+    # RUN GENOTYPEGVCFs
+    
+
+    echo
+    echo "============================================================"
+    echo "STEP: GenotypeGVCFs"
+    echo "============================================================"
+    echo "Started: $(date)"
+
+    gatk --java-options "-Xmx56g" GenotypeGVCFs \
+        -R "${REFERENCE}" \
+        -V "gendb://${GENOMICSDB}" \
+        -O "${JOINT_VCF}" \
+        --tmp-dir "${TMP_DIR}" \
+        -L "${INTERVALS}"
+
+    echo
+    echo "GenotypeGVCFs command completed."
+    echo "Finished: $(date)"
+
+    
+    # VERIFY OUTPUT
+    
+
+    echo
+    echo "Checking GenotypeGVCFs output..."
+
+    if [[ ! -s "${JOINT_VCF}" ]]; then
+        echo "ERROR: Joint VCF was not created or is empty."
+        exit 1
+    fi
+
+    if [[ ! -s "${JOINT_TBI}" ]]; then
+        echo "ERROR: Joint VCF index was not created or is empty."
+        exit 1
+    fi
+
+    
+    # ONLY NOW MARK GENOTYPEGVCFs COMPLETE
+    
+
+    touch "${JOINT_DONE}"
+
+    echo
+    echo "GenotypeGVCFs completed successfully."
+    echo "Completion marker created:"
+    echo "${JOINT_DONE}"
+
+fi
+
+
+# FINAL CHECKS
+
+
+echo
+echo "============================================================"
+echo "FINAL GENOTYPEGVCFs OUTPUT"
+echo "============================================================"
+
+ls -lh "${JOINT_VCF}"
+ls -lh "${JOINT_TBI}"
+
+echo
+echo "Checking VCF header..."
+
+bcftools view -h "${JOINT_VCF}" | head -20
+
+echo
+echo "Checking VCF index..."
+
+bcftools index -n "${JOINT_VCF}"
+
+echo
+echo "============================================================"
+echo "GENOTYPEGVCFs STAGE COMPLETED"
+echo "Finished: $(date)"
+echo "============================================================"
+
+echo
+echo "Joint-called VCF:"
+echo "${JOINT_VCF}"
+
+echo
+echo "Joint VCF index:"
+echo "${JOINT_TBI}"
+
+echo
+echo "Next stage will be VQSR in a SEPARATE script."

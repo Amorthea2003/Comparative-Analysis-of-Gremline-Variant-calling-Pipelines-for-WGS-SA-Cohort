@@ -1,0 +1,378 @@
+#!/bin/bash
+#PBS -N GATK_Final
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+
+# Paths
+
+
+OUTDIR="/stor6/scratch3/27777197/gatk_cohort/output"
+REF="/new-home/27777197/Variantcalling/reference/hg38.fa"
+FAI="/new-home/27777197/Variantcalling/reference/hg38.fa.fai"
+
+FINAL="${OUTDIR}/gatk_final.vcf.gz"
+FINAL_CSI="${FINAL}.csi"
+DONE="${OUTDIR}/GATK_FINAL.done"
+
+TMP_CONCAT="${OUTDIR}/gatk_final.concat.tmp.vcf.gz"
+TMP_SORTED="${OUTDIR}/gatk_final.sorted.tmp.vcf.gz"
+SORT_TMP="${OUTDIR}/gatk_final_sort_tmp"
+
+
+# Environment
+
+
+module load app/bcftools/1.19
+
+echo "========================================"
+echo "GATK FINAL VCF ASSEMBLY"
+echo "========================================"
+echo "Job ID:    ${PBS_JOBID}"
+echo "Host:      $(hostname)"
+echo "Start:     $(date)"
+echo "bcftools:  $(bcftools --version | head -1)"
+echo
+
+
+# Safety: do not overwrite an existing successful final file
+
+
+if [[ -e "$DONE" ]]; then
+    echo "ERROR: GATK_FINAL.done already exists."
+    echo "Final VCF appears to have already completed."
+    echo "Remove the marker only after deliberately deciding to rerun."
+    exit 1
+fi
+
+if [[ -e "$FINAL" || -e "$FINAL_CSI" ]]; then
+    echo "ERROR: A final VCF or CSI already exists:"
+    echo "$FINAL"
+    echo "$FINAL_CSI"
+    echo
+    echo "Refusing to overwrite existing final files."
+    exit 1
+fi
+
+
+# 1. Check reference files
+
+
+echo "Checking reference..."
+
+[[ -s "$REF" ]] || {
+    echo "ERROR: Reference FASTA missing:"
+    echo "$REF"
+    exit 1
+}
+
+[[ -s "$FAI" ]] || {
+    echo "ERROR: Reference FAI missing:"
+    echo "$FAI"
+    exit 1
+}
+
+echo "Reference FASTA: OK"
+echo "Reference FAI:   OK"
+
+
+# 2. Check all 8 chunk VCFs and CSI indexes
+
+
+echo
+echo "Checking all 8 chunk VCFs and CSI indexes..."
+
+for i in {01..08}; do
+
+    VCF="${OUTDIR}/gatk_chunk_${i}.vcf.gz"
+    CSI="${VCF}.csi"
+
+    if [[ ! -s "$VCF" ]]; then
+        echo "ERROR: Missing/empty VCF:"
+        echo "$VCF"
+        exit 1
+    fi
+
+    if [[ ! -s "$CSI" ]]; then
+        echo "ERROR: Missing/empty CSI:"
+        echo "$CSI"
+        exit 1
+    fi
+
+    echo "  chunk_${i}: VCF OK, CSI OK"
+
+done
+
+echo "All 8 chunks passed."
+
+
+# 3. Verify hg38 contig order against chunk VCF header
+
+
+echo
+echo "Checking hg38 contig order..."
+
+FAI_CONTIGS="${OUTDIR}/hg38_fai_contigs.tmp"
+VCF_CONTIGS="${OUTDIR}/gatk_vcf_contigs.tmp"
+
+cut -f1 "$FAI" > "$FAI_CONTIGS"
+
+bcftools view -h "${OUTDIR}/gatk_chunk_01.vcf.gz" \
+    | sed -n 's/^##contig=<ID=\([^,]*\),.*/\1/p' \
+    > "$VCF_CONTIGS"
+
+if ! cmp -s "$FAI_CONTIGS" "$VCF_CONTIGS"; then
+    echo "ERROR: VCF contig order does not exactly match hg38 FAI order."
+    echo
+    echo "First differences:"
+    diff -u "$FAI_CONTIGS" "$VCF_CONTIGS" | head -50 || true
+    rm -f "$FAI_CONTIGS" "$VCF_CONTIGS"
+    exit 1
+fi
+
+rm -f "$FAI_CONTIGS" "$VCF_CONTIGS"
+
+echo "hg38 contig order: OK"
+
+
+# 4. Confirm all chunks contain the same 44 samples
+
+
+echo
+echo "Checking sample lists..."
+
+REFERENCE_SAMPLES="${OUTDIR}/gatk_reference_samples.tmp"
+
+bcftools query -l "${OUTDIR}/gatk_chunk_01.vcf.gz" \
+    > "$REFERENCE_SAMPLES"
+
+SAMPLE_COUNT=$(wc -l < "$REFERENCE_SAMPLES")
+
+if [[ "$SAMPLE_COUNT" -ne 44 ]]; then
+    echo "ERROR: Chunk 01 contains $SAMPLE_COUNT samples; expected 44."
+    rm -f "$REFERENCE_SAMPLES"
+    exit 1
+fi
+
+for i in {02..08}; do
+
+    CURRENT_SAMPLES="${OUTDIR}/gatk_chunk_${i}_samples.tmp"
+
+    bcftools query -l "${OUTDIR}/gatk_chunk_${i}.vcf.gz" \
+        > "$CURRENT_SAMPLES"
+
+    CURRENT_COUNT=$(wc -l < "$CURRENT_SAMPLES")
+
+    if [[ "$CURRENT_COUNT" -ne 44 ]]; then
+        echo "ERROR: Chunk ${i} contains ${CURRENT_COUNT} samples; expected 44."
+        rm -f "$REFERENCE_SAMPLES" "$CURRENT_SAMPLES"
+        exit 1
+    fi
+
+    if ! cmp -s "$REFERENCE_SAMPLES" "$CURRENT_SAMPLES"; then
+        echo "ERROR: Sample list/order differs in chunk ${i}."
+        rm -f "$REFERENCE_SAMPLES" "$CURRENT_SAMPLES"
+        exit 1
+    fi
+
+    rm -f "$CURRENT_SAMPLES"
+
+done
+
+rm -f "$REFERENCE_SAMPLES"
+
+echo "All chunks contain the same 44 samples in the same order."
+
+
+# 5. Remove stale temporary files
+
+
+echo
+echo "Cleaning temporary files..."
+
+rm -f "$TMP_CONCAT"
+rm -f "$TMP_SORTED"
+rm -rf "$SORT_TMP"
+
+
+# 6. Concatenate the 8 chunks
+
+
+echo
+echo "========================================"
+echo "Concatenating 8 chunks"
+echo "========================================"
+
+bcftools concat \
+    -Oz \
+    -o "$TMP_CONCAT" \
+    "${OUTDIR}/gatk_chunk_01.vcf.gz" \
+    "${OUTDIR}/gatk_chunk_02.vcf.gz" \
+    "${OUTDIR}/gatk_chunk_03.vcf.gz" \
+    "${OUTDIR}/gatk_chunk_04.vcf.gz" \
+    "${OUTDIR}/gatk_chunk_05.vcf.gz" \
+    "${OUTDIR}/gatk_chunk_06.vcf.gz" \
+    "${OUTDIR}/gatk_chunk_07.vcf.gz" \
+    "${OUTDIR}/gatk_chunk_08.vcf.gz"
+
+[[ -s "$TMP_CONCAT" ]] || {
+    echo "ERROR: Concatenation produced no VCF."
+    exit 1
+}
+
+echo "Concatenation completed successfully."
+
+
+# 7. Sort combined VCF
+
+
+echo
+echo "========================================"
+echo "Sorting combined VCF"
+echo "========================================"
+
+mkdir -p "$SORT_TMP"
+
+bcftools sort \
+    -T "$SORT_TMP" \
+    -Oz \
+    -o "$TMP_SORTED" \
+    "$TMP_CONCAT"
+
+[[ -s "$TMP_SORTED" ]] || {
+    echo "ERROR: Sorting produced no VCF."
+    exit 1
+}
+
+echo "Sorting completed successfully."
+
+
+# 8. Move sorted VCF into final location
+
+
+mv "$TMP_SORTED" "$FINAL"
+
+
+# 9. Create final CSI index
+
+
+echo
+echo "========================================"
+echo "Creating final CSI index"
+echo "========================================"
+
+bcftools index \
+    --csi \
+    -f \
+    "$FINAL"
+
+[[ -s "$FINAL_CSI" ]] || {
+    echo "ERROR: Final CSI index was not created."
+    exit 1
+}
+
+echo "CSI index created successfully."
+
+
+# 10. Validate final VCF readability
+
+
+echo
+echo "========================================"
+echo "Validating final VCF"
+echo "========================================"
+
+# Header must be readable
+bcftools view \
+    -h \
+    "$FINAL" \
+    > /dev/null
+
+# Entire VCF must be readable
+bcftools view \
+    -H \
+    "$FINAL" \
+    > /dev/null
+
+echo "VCF readability: PASS"
+
+
+# 11. Validate exactly 44 samples
+
+
+echo
+echo "Checking final sample count..."
+
+FINAL_SAMPLE_COUNT=$(bcftools query -l "$FINAL" | wc -l)
+
+echo "Final sample count: $FINAL_SAMPLE_COUNT"
+
+if [[ "$FINAL_SAMPLE_COUNT" -ne 44 ]]; then
+    echo "ERROR: Final VCF contains $FINAL_SAMPLE_COUNT samples."
+    echo "Expected exactly 44."
+    exit 1
+fi
+
+echo "44-sample validation: PASS"
+
+
+# 12. Validate final VCF has an index that can be used
+
+
+echo
+echo "Testing indexed access..."
+
+bcftools view \
+    -r chr1 \
+    "$FINAL" \
+    > /dev/null
+
+echo "Indexed access: PASS"
+
+
+# 13. Basic final information
+
+
+echo
+echo "========================================"
+echo "FINAL VCF INFORMATION"
+echo "========================================"
+
+echo "Final VCF:"
+ls -lh "$FINAL"
+
+echo
+echo "Final CSI:"
+ls -lh "$FINAL_CSI"
+
+echo
+echo "Samples:"
+bcftools query -l "$FINAL"
+
+echo
+echo "========================================"
+echo "Cleaning temporary files"
+echo "========================================"
+
+rm -f "$TMP_CONCAT"
+rm -rf "$SORT_TMP"
+
+
+# 14. SUCCESS MARKER
+
+
+touch "$DONE"
+
+echo
+echo "========================================"
+echo "GATK FINAL ASSEMBLY SUCCESSFUL"
+echo "========================================"
+echo "Final VCF: $FINAL"
+echo "CSI:       $FINAL_CSI"
+echo "Samples:   $FINAL_SAMPLE_COUNT"
+echo "Marker:    $DONE"
+echo "Finished:  $(date)"
+echo "========================================"

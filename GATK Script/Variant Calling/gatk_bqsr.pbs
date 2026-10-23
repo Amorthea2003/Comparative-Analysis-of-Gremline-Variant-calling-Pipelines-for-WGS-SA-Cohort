@@ -1,0 +1,517 @@
+#!/bin/bash
+
+#PBS -N GATK_BQSR
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -M 27777197@sun.ac.za
+#PBS -m abe
+
+set -euo pipefail
+
+
+# CHECK SAMPLE
+
+
+if [[ -z "${SAMPLE:-}" ]]; then
+    echo "ERROR: SAMPLE was not specified."
+    echo
+    echo "Usage:"
+    echo "qsub -v SAMPLE=<sample> ~/Variantcalling/gatk/gatk_bqsr.pbs"
+    exit 1
+fi
+
+
+# DIRECTORIES
+
+
+BASE_DIR="${HOME}/Variantcalling"
+
+GATK_DIR="${BASE_DIR}/gatk/${SAMPLE}"
+REF_DIR="${BASE_DIR}/reference"
+BQSR_DIR="${REF_DIR}/bqsr"
+
+mkdir -p "${GATK_DIR}"
+
+
+# CPU SETTINGS
+
+
+# PBS reserves 8 CPUs for this job.
+CPUS="${PBS_NCPUS:-8}"
+
+# Use 8 CPUs for samtools index.
+SAMTOOLS_THREADS="${CPUS}"
+
+# Java heap.
+JAVA_HEAP="24g"
+
+
+# FILE PATHS
+
+
+REF="${REF_DIR}/hg38.fa"
+REF_FAI="${REF}.fai"
+REF_DICT="${REF_DIR}/hg38.dict"
+
+INPUT_BAM="${GATK_DIR}/${SAMPLE}_dedup_fixed.bam"
+INPUT_BAI="${INPUT_BAM}.bai"
+
+DBSNP="${BQSR_DIR}/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+DBSNP_TBI="${DBSNP}.tbi"
+
+MILLS="${BQSR_DIR}/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+MILLS_TBI="${MILLS}.tbi"
+
+KNOWN_INDELS="${BQSR_DIR}/Homo_sapiens_assembly38.known_indels.vcf.gz"
+KNOWN_INDELS_TBI="${KNOWN_INDELS}.tbi"
+
+RECAL_TABLE="${GATK_DIR}/${SAMPLE}_recal_data.table"
+
+BQSR_BAM="${GATK_DIR}/${SAMPLE}_bqsr.bam"
+BQSR_BAI="${GATK_DIR}/${SAMPLE}_bqsr.bai"
+
+TMP_RECAL_BAM="${GATK_DIR}/${SAMPLE}_bqsr.tmp.bam"
+
+LOG_FILE="${GATK_DIR}/bqsr.log"
+DONE_FILE="${GATK_DIR}/bqsr.done"
+
+
+# LOGGING
+
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "${LOG_FILE}"
+}
+
+
+# START
+
+
+log "============================================================"
+log "STARTING GATK BQSR"
+log "Sample: ${SAMPLE}"
+log "============================================================"
+
+log "Node: $(hostname)"
+log "Job ID: ${PBS_JOBID:-unknown}"
+log "PBS CPUs: ${CPUS}"
+log "Memory requested: 32 GB"
+log "Java heap: ${JAVA_HEAP}"
+
+cd "${GATK_DIR}"
+
+
+# LOAD MODULES
+
+
+log "Loading modules..."
+
+module purge
+
+module load app/gatk/4.4.0.0
+module load app/samtools/1.20
+
+log "GATK version:"
+gatk --version 2>&1 | tee -a "${LOG_FILE}"
+
+log "Samtools version:"
+samtools --version | head -1 | tee -a "${LOG_FILE}"
+
+
+# CHECK REFERENCE
+
+
+log "Checking reference genome..."
+
+if [[ ! -s "${REF}" ]]; then
+    log "ERROR: Reference genome not found:"
+    log "${REF}"
+    exit 1
+fi
+
+if [[ ! -s "${REF_FAI}" ]]; then
+    log "ERROR: Reference FASTA index not found:"
+    log "${REF_FAI}"
+    exit 1
+fi
+
+if [[ ! -s "${REF_DICT}" ]]; then
+    log "ERROR: Reference dictionary not found:"
+    log "${REF_DICT}"
+    exit 1
+fi
+
+log "Reference genome OK."
+
+
+# CHECK INPUT BAM
+
+
+log "Checking input BAM..."
+
+if [[ ! -s "${INPUT_BAM}" ]]; then
+    log "ERROR: Input BAM not found or empty:"
+    log "${INPUT_BAM}"
+    exit 1
+fi
+
+if [[ ! -s "${INPUT_BAI}" ]]; then
+    log "ERROR: Input BAM index not found or empty:"
+    log "${INPUT_BAI}"
+    exit 1
+fi
+
+log "Input BAM:"
+ls -lh "${INPUT_BAM}" | tee -a "${LOG_FILE}"
+
+log "Input BAM index:"
+ls -lh "${INPUT_BAI}" | tee -a "${LOG_FILE}"
+
+
+# CHECK READ GROUP
+
+
+log "Checking BAM read groups..."
+
+RG_LINES=$(samtools view -H "${INPUT_BAM}" | grep '^@RG' || true)
+
+if [[ -z "${RG_LINES}" ]]; then
+    log "ERROR: No @RG read group found in BAM."
+    exit 1
+fi
+
+log "Read group:"
+echo "${RG_LINES}" | tee -a "${LOG_FILE}"
+
+RG_COUNT=$(echo "${RG_LINES}" | wc -l)
+
+log "Number of read groups: ${RG_COUNT}"
+
+
+# CHECK PLATFORM
+
+
+PLATFORM=$(echo "${RG_LINES}" |
+    sed -n 's/.*PL:\([^[:space:]]*\).*/\1/p' |
+    head -1)
+
+if [[ -z "${PLATFORM}" ]]; then
+    log "ERROR: No PL (platform) field found in read group."
+    exit 1
+fi
+
+log "Read-group platform: ${PLATFORM}"
+
+if [[ "${PLATFORM}" != "DNBSEQ" &&
+      "${PLATFORM}" != "ILLUMINA" &&
+      "${PLATFORM}" != "COMPLETE" ]]; then
+
+    log "WARNING: Unexpected PL:${PLATFORM} field."
+else
+    log "Platform confirmed: ${PLATFORM}"
+fi
+
+
+# CHECK SAMPLE NAME
+
+
+RG_SAMPLE=$(echo "${RG_LINES}" |
+    sed -n 's/.*SM:\([^[:space:]]*\).*/\1/p' |
+    head -1)
+
+if [[ -z "${RG_SAMPLE}" ]]; then
+    log "ERROR: No SM (sample) field found in read group."
+    exit 1
+fi
+
+log "Read-group sample: ${RG_SAMPLE}"
+
+if [[ "${RG_SAMPLE}" != "${SAMPLE}" ]]; then
+    log "WARNING: BAM SM (${RG_SAMPLE}) does not exactly match SAMPLE (${SAMPLE})."
+else
+    log "Sample name confirmed."
+fi
+
+
+# CHECK KNOWN-SITES
+
+
+log "Checking known-sites resources..."
+
+if [[ ! -s "${DBSNP}" ]]; then
+    log "ERROR: dbSNP VCF not found:"
+    log "${DBSNP}"
+    exit 1
+fi
+
+if [[ ! -s "${DBSNP_TBI}" ]]; then
+    log "ERROR: dbSNP index not found:"
+    log "${DBSNP_TBI}"
+    exit 1
+fi
+
+if [[ ! -s "${MILLS}" ]]; then
+    log "ERROR: Mills/1000G VCF not found:"
+    log "${MILLS}"
+    exit 1
+fi
+
+if [[ ! -s "${MILLS_TBI}" ]]; then
+    log "ERROR: Mills/1000G index not found:"
+    log "${MILLS_TBI}"
+    exit 1
+fi
+
+if [[ ! -s "${KNOWN_INDELS}" ]]; then
+    log "ERROR: Known indels VCF not found:"
+    log "${KNOWN_INDELS}"
+    exit 1
+fi
+
+if [[ ! -s "${KNOWN_INDELS_TBI}" ]]; then
+    log "ERROR: Known indels index not found:"
+    log "${KNOWN_INDELS_TBI}"
+    exit 1
+fi
+
+log "All three known-sites resources found."
+
+
+# CHECK FOR COMPLETE BQSR
+
+
+if [[ -s "${BQSR_BAM}" &&
+      -s "${BQSR_BAI}" &&
+      -s "${RECAL_TABLE}" &&
+      -s "${DONE_FILE}" ]]; then
+
+    log "============================================================"
+    log "BQSR ALREADY COMPLETED"
+    log "Sample: ${SAMPLE}"
+    log "============================================================"
+
+    ls -lh \
+        "${RECAL_TABLE}" \
+        "${BQSR_BAM}" \
+        "${BQSR_BAI}" \
+        "${DONE_FILE}" | tee -a "${LOG_FILE}"
+
+    exit 0
+fi
+
+
+# STEP 1: BASE RECALIBRATOR
+
+
+if [[ -s "${RECAL_TABLE}" ]]; then
+
+    log "Recalibration table already exists."
+    log "Skipping BaseRecalibrator."
+
+else
+
+    log "============================================================"
+    log "STEP 1: BASE RECALIBRATOR"
+    log "============================================================"
+
+    log "Input BAM:"
+    log "${INPUT_BAM}"
+
+    log "Running BaseRecalibrator with -Xmx${JAVA_HEAP}..."
+
+    gatk --java-options "-Xmx${JAVA_HEAP}" BaseRecalibrator \
+        -R "${REF}" \
+        -I "${INPUT_BAM}" \
+        --known-sites "${DBSNP}" \
+        --known-sites "${MILLS}" \
+        --known-sites "${KNOWN_INDELS}" \
+        -O "${RECAL_TABLE}" \
+        2>&1 | tee -a "${LOG_FILE}"
+
+    if [[ ! -s "${RECAL_TABLE}" ]]; then
+        log "ERROR: BaseRecalibrator did not produce:"
+        log "${RECAL_TABLE}"
+        exit 1
+    fi
+
+    log "BaseRecalibrator completed successfully."
+
+    ls -lh "${RECAL_TABLE}" | tee -a "${LOG_FILE}"
+
+fi
+
+
+# STEP 2: APPLY BQSR
+
+
+if [[ -s "${BQSR_BAM}" ]]; then
+
+    log "BQSR BAM already exists."
+    log "Skipping ApplyBQSR."
+
+else
+
+    log "============================================================"
+    log "STEP 2: APPLY BQSR"
+    log "============================================================"
+
+    log "Input BAM:"
+    log "${INPUT_BAM}"
+
+    log "Recalibration table:"
+    log "${RECAL_TABLE}"
+
+    log "Output BAM:"
+    log "${BQSR_BAM}"
+
+    # Remove incomplete temporary BAM
+    rm -f "${TMP_RECAL_BAM}"
+
+    log "Running ApplyBQSR with -Xmx${JAVA_HEAP}..."
+
+    gatk --java-options "-Xmx${JAVA_HEAP}" ApplyBQSR \
+        -R "${REF}" \
+        -I "${INPUT_BAM}" \
+        --bqsr-recal-file "${RECAL_TABLE}" \
+        -O "${TMP_RECAL_BAM}" \
+        2>&1 | tee -a "${LOG_FILE}"
+
+    if [[ ! -s "${TMP_RECAL_BAM}" ]]; then
+        log "ERROR: ApplyBQSR did not produce a BAM."
+        exit 1
+    fi
+
+    # Move only after successful completion
+    mv "${TMP_RECAL_BAM}" "${BQSR_BAM}"
+
+    log "ApplyBQSR completed successfully."
+
+    ls -lh "${BQSR_BAM}" | tee -a "${LOG_FILE}"
+
+fi
+
+
+# STEP 3: INDEX BQSR BAM USING SAMTOOLS
+
+
+if [[ -s "${BQSR_BAI}" ]]; then
+
+    log "BQSR BAM index already exists."
+    log "Skipping indexing."
+
+else
+
+    log "============================================================"
+    log "STEP 3: INDEX BQSR BAM"
+    log "============================================================"
+
+    log "Running samtools index using ${SAMTOOLS_THREADS} CPUs..."
+
+    samtools index \
+        -@ "${SAMTOOLS_THREADS}" \
+        "${BQSR_BAM}" \
+        "${BQSR_BAI}" \
+        2>&1 | tee -a "${LOG_FILE}"
+
+    if [[ ! -s "${BQSR_BAI}" ]]; then
+        log "ERROR: BQSR BAM index was not created."
+        exit 1
+    fi
+
+    log "BQSR BAM indexing completed successfully."
+
+    ls -lh "${BQSR_BAI}" | tee -a "${LOG_FILE}"
+
+fi
+
+
+# FINAL VALIDATION
+
+
+log "============================================================"
+log "FINAL OUTPUT CHECK"
+log "============================================================"
+
+if [[ ! -s "${RECAL_TABLE}" ]]; then
+    log "ERROR: Recalibration table missing."
+    exit 1
+fi
+
+if [[ ! -s "${BQSR_BAM}" ]]; then
+    log "ERROR: BQSR BAM missing."
+    exit 1
+fi
+
+if [[ ! -s "${BQSR_BAI}" ]]; then
+    log "ERROR: BQSR BAM index missing."
+    exit 1
+fi
+
+log "All BQSR outputs are present."
+
+
+# VERIFY BQSR BAM
+
+
+log "Verifying BQSR BAM..."
+
+if ! samtools quickcheck -v "${BQSR_BAM}" 2>&1 |
+    tee -a "${LOG_FILE}"; then
+
+    log "ERROR: samtools quickcheck failed."
+    exit 1
+fi
+
+log "BAM quickcheck passed."
+
+
+# VERIFY INDEX
+
+
+log "Checking BAM index..."
+
+if ! samtools idxstats "${BQSR_BAM}" > /dev/null 2>&1; then
+    log "ERROR: BAM index verification failed."
+    exit 1
+fi
+
+log "BAM index verification passed."
+
+
+# CREATE COMPLETION MARKER
+
+
+{
+    echo "Sample: ${SAMPLE}"
+    echo "Status: BQSR completed successfully"
+    echo "Date: $(date)"
+    echo "Node: $(hostname)"
+    echo "Platform: ${PLATFORM}"
+    echo "PBS CPUs: ${CPUS}"
+    echo "Recalibration table: ${RECAL_TABLE}"
+    echo "BQSR BAM: ${BQSR_BAM}"
+    echo "BQSR BAI: ${BQSR_BAI}"
+} > "${DONE_FILE}"
+
+
+# COMPLETED
+
+
+log "============================================================"
+log "GATK BQSR COMPLETED SUCCESSFULLY"
+log "Sample: ${SAMPLE}"
+log "============================================================"
+
+log "Recalibration table:"
+ls -lh "${RECAL_TABLE}" | tee -a "${LOG_FILE}"
+
+log "BQSR BAM:"
+ls -lh "${BQSR_BAM}" | tee -a "${LOG_FILE}"
+
+log "BQSR BAM index:"
+ls -lh "${BQSR_BAI}" | tee -a "${LOG_FILE}"
+
+log "Completion marker:"
+ls -lh "${DONE_FILE}" | tee -a "${LOG_FILE}"
+
+log "============================================================"

@@ -1,0 +1,492 @@
+#!/bin/bash
+
+#PBS -N GATK_recovery
+#PBS -l walltime=96:00:00
+#PBS -l select=1:ncpus=24:mem=64gb
+#PBS -M 27777197@sun.ac.za
+#PBS -m abe
+
+set -euo pipefail
+
+
+
+# CHECK SAMPLE
+
+
+if [[ -z "${SAMPLE:-}" ]]; then
+    echo "ERROR: SAMPLE was not specified."
+    echo "Usage: qsub -v SAMPLE=1004 gatk_recovery.pbs"
+    exit 1
+fi
+
+
+
+# DIRECTORIES
+
+
+BASE_DIR="${HOME}/Variantcalling"
+OUT_DIR="${BASE_DIR}/gatk/${SAMPLE}"
+
+mkdir -p "${OUT_DIR}"
+
+LOG_FILE="${OUT_DIR}/recovery.log"
+
+
+
+# LOGGING
+
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "${LOG_FILE}"
+}
+
+
+
+# FILE NAMES
+
+
+SAM_FILE="${OUT_DIR}/${SAMPLE}.sam"
+BAM_FILE="${OUT_DIR}/${SAMPLE}.bam"
+SORTED_BAM="${OUT_DIR}/${SAMPLE}_sorted.bam"
+
+DEDUP_BAM="${OUT_DIR}/${SAMPLE}_dedup.bam"
+DEDUP_BAI="${OUT_DIR}/${SAMPLE}_dedup.bam.bai"
+
+DUP_METRICS="${OUT_DIR}/${SAMPLE}_duplicate_metrics.txt"
+VALIDATION="${OUT_DIR}/${SAMPLE}_ValidateSamFile.txt"
+
+
+
+# JOB / NODE INFORMATION
+
+
+JOB_ID="${PBS_JOBID:-manual}"
+NODE="$(hostname)"
+
+TMP_DIR="/var/tmp/gatk_${SAMPLE}_${JOB_ID}"
+
+mkdir -p "${TMP_DIR}"
+
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+
+
+# START
+
+
+log "============================================================"
+log "Starting GATK recovery for sample ${SAMPLE}"
+log "============================================================"
+log "Node: ${NODE}"
+log "Job ID: ${JOB_ID}"
+log "Temporary directory: ${TMP_DIR}"
+
+
+
+# LOAD SAMTOOLS FOR CHECKS
+
+
+module purge
+module load app/samtools/1.20
+
+
+
+# CHECK TEMPORARY DISK SPACE
+
+
+log "Checking temporary disk space..."
+
+TMP_AVAIL_KB=$(df -Pk "${TMP_DIR}" | awk 'NR==2 {print $4}')
+TMP_AVAIL_GB=$((TMP_AVAIL_KB / 1024 / 1024))
+
+log "Temporary disk available: ${TMP_AVAIL_GB} GB"
+
+# MarkDuplicates for these very large BAMs can require substantial
+# temporary disk space. Refuse to start if less than 40 GB is free.
+
+if (( TMP_AVAIL_GB < 40 )); then
+    log "ERROR: Less than 40 GB available in ${TMP_DIR}."
+    log "Refusing to start MarkDuplicates."
+    exit 1
+fi
+
+
+
+# CHECK FINAL OUTPUTS
+
+
+if [[ -f "${DEDUP_BAM}" && -f "${DEDUP_BAI}" && \
+      -f "${DUP_METRICS}" && -f "${VALIDATION}" ]]; then
+
+    log "Sample ${SAMPLE} is already complete."
+    log "Deduplicated BAM: ${DEDUP_BAM}"
+    log "BAM index: ${DEDUP_BAI}"
+    log "Duplicate metrics: ${DUP_METRICS}"
+    log "Validation: ${VALIDATION}"
+    log "Nothing to do."
+    exit 0
+fi
+
+
+
+# STAGE 1 — PREPARE SORTED BAM
+
+
+if [[ -f "${SORTED_BAM}" ]]; then
+
+    log "Found sorted BAM:"
+    log "${SORTED_BAM}"
+
+    log "Checking sorted BAM integrity..."
+
+    samtools quickcheck "${SORTED_BAM}"
+
+    log "Sorted BAM passed quickcheck."
+    log "Skipping SAM/BAM conversion and sorting."
+
+
+elif [[ -f "${BAM_FILE}" ]]; then
+
+    log "Found BAM:"
+    log "${BAM_FILE}"
+
+    log "Checking BAM integrity..."
+
+    samtools quickcheck "${BAM_FILE}"
+
+    log "BAM passed quickcheck."
+
+
+    # --------------------------------------------------------
+    # REMOVE OLD SORT TEMPORARY FILES
+    # --------------------------------------------------------
+
+    if compgen -G "${OUT_DIR}/${SAMPLE}_sort_temp.*.bam" > /dev/null; then
+
+        log "Removing incomplete sorting temporary files..."
+
+        rm -f "${OUT_DIR}/${SAMPLE}_sort_temp."*.bam
+
+        log "Old sorting temporary files removed."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # SORT BAM
+    # --------------------------------------------------------
+
+    log "Starting BAM sorting..."
+
+    samtools sort \
+        -@ 24 \
+        -m 1G \
+        -T "${TMP_DIR}/${SAMPLE}_sort_temp" \
+        -o "${SORTED_BAM}" \
+        "${BAM_FILE}"
+
+    log "Finished BAM sorting."
+
+
+    # --------------------------------------------------------
+    # CHECK SORTED BAM
+    # --------------------------------------------------------
+
+    if [[ ! -s "${SORTED_BAM}" ]]; then
+        log "ERROR: Sorted BAM was not created."
+        exit 1
+    fi
+
+    samtools quickcheck "${SORTED_BAM}"
+
+    log "Sorted BAM passed quickcheck."
+
+
+    # --------------------------------------------------------
+    # REMOVE INTERMEDIATE BAM
+    # --------------------------------------------------------
+
+    log "Removing intermediate BAM..."
+
+    rm -f "${BAM_FILE}"
+
+    log "Intermediate BAM removed."
+
+
+else
+
+    # ========================================================
+    # SAM EXISTS
+    # ========================================================
+
+    if [[ ! -f "${SAM_FILE}" ]]; then
+
+        log "ERROR: No SAM, BAM or sorted BAM found."
+        log "Cannot recover sample ${SAMPLE}."
+
+        exit 1
+    fi
+
+
+    log "Found SAM:"
+    log "${SAM_FILE}"
+
+    log "Starting SAM to BAM conversion..."
+
+
+    # --------------------------------------------------------
+    # SAM TO BAM
+    # --------------------------------------------------------
+
+    samtools view \
+        -@ 24 \
+        -b \
+        "${SAM_FILE}" \
+        -o "${BAM_FILE}"
+
+    log "Finished SAM to BAM conversion."
+
+
+    # --------------------------------------------------------
+    # CHECK BAM
+    # --------------------------------------------------------
+
+    samtools quickcheck "${BAM_FILE}"
+
+    log "BAM passed quickcheck."
+
+
+    # --------------------------------------------------------
+    # SORT BAM
+    # --------------------------------------------------------
+
+    log "Starting BAM sorting..."
+
+    samtools sort \
+        -@ 24 \
+        -m 1G \
+        -T "${TMP_DIR}/${SAMPLE}_sort_temp" \
+        -o "${SORTED_BAM}" \
+        "${BAM_FILE}"
+
+    log "Finished BAM sorting."
+
+
+    # --------------------------------------------------------
+    # CHECK SORTED BAM
+    # --------------------------------------------------------
+
+    if [[ ! -s "${SORTED_BAM}" ]]; then
+        log "ERROR: Sorted BAM was not created."
+        exit 1
+    fi
+
+    samtools quickcheck "${SORTED_BAM}"
+
+    log "Sorted BAM passed quickcheck."
+
+
+    # --------------------------------------------------------
+    # REMOVE SAM AND BAM
+    # --------------------------------------------------------
+
+    log "Removing intermediate SAM/BAM files..."
+
+    rm -f "${SAM_FILE}"
+    rm -f "${BAM_FILE}"
+
+    log "Intermediate SAM/BAM files removed."
+
+fi
+
+
+
+# STAGE 2 — MARK DUPLICATES
+
+
+if [[ -f "${DEDUP_BAM}" ]]; then
+
+    log "Found existing deduplicated BAM:"
+    log "${DEDUP_BAM}"
+
+    log "Skipping MarkDuplicates."
+
+else
+
+    log "============================================================"
+    log "Starting MarkDuplicates"
+    log "Sample: ${SAMPLE}"
+    log "Input: ${SORTED_BAM}"
+    log "Output: ${DEDUP_BAM}"
+    log "Temporary directory: ${TMP_DIR}"
+    log "============================================================"
+
+    module purge
+    module load app/gatk/4.4.0.0
+
+    gatk MarkDuplicates \
+        -I "${SORTED_BAM}" \
+        -O "${DEDUP_BAM}" \
+        -M "${DUP_METRICS}" \
+        --TMP_DIR "${TMP_DIR}"
+
+    log "Finished MarkDuplicates."
+
+fi
+
+
+
+# CHECK DEDUP BAM
+
+
+if [[ ! -s "${DEDUP_BAM}" ]]; then
+    log "ERROR: Deduplicated BAM does not exist or is empty."
+    exit 1
+fi
+
+log "Deduplicated BAM exists:"
+ls -lh "${DEDUP_BAM}"
+
+log "Checking deduplicated BAM integrity..."
+
+samtools quickcheck "${DEDUP_BAM}"
+
+log "Deduplicated BAM passed quickcheck."
+
+
+
+# STAGE 3 — CREATE BAM INDEX
+
+
+if [[ -f "${DEDUP_BAI}" ]]; then
+
+    log "Found existing BAM index:"
+    log "${DEDUP_BAI}"
+
+else
+
+    log "============================================================"
+    log "Starting BAM indexing"
+    log "============================================================"
+
+    # Use 8 threads rather than 24.
+    # The index job itself should be submitted with sufficient RAM.
+
+    samtools index \
+        -@ 8 \
+        "${DEDUP_BAM}" \
+        "${DEDUP_BAI}"
+
+    log "Finished BAM indexing."
+
+fi
+
+
+
+# CHECK INDEX
+
+
+if [[ ! -s "${DEDUP_BAI}" ]]; then
+    log "ERROR: BAM index was not created."
+    exit 1
+fi
+
+log "BAM index exists:"
+ls -lh "${DEDUP_BAI}"
+
+
+
+# STAGE 4 — REMOVE SORTED BAM
+
+
+if [[ -f "${SORTED_BAM}" ]]; then
+
+    log "Removing intermediate sorted BAM..."
+
+    rm -f "${SORTED_BAM}"
+
+    log "Intermediate sorted BAM removed."
+
+fi
+
+
+
+# STAGE 5 — VALIDATE BAM
+
+
+if [[ -f "${VALIDATION}" ]]; then
+
+    log "Validation file already exists."
+    log "Skipping ValidateSamFile."
+
+else
+
+    log "============================================================"
+    log "Starting ValidateSamFile"
+    log "============================================================"
+
+    module purge
+    module load app/gatk/4.4.0.0
+
+    gatk ValidateSamFile \
+        -I "${DEDUP_BAM}" \
+        -M SUMMARY \
+        -O "${VALIDATION}"
+
+    log "Finished ValidateSamFile."
+
+fi
+
+
+
+# FINAL CHECKS
+
+
+log "============================================================"
+log "Performing final checks"
+log "============================================================"
+
+if [[ ! -s "${DEDUP_BAM}" ]]; then
+    log "ERROR: Deduplicated BAM missing."
+    exit 1
+fi
+
+if [[ ! -s "${DEDUP_BAI}" ]]; then
+    log "ERROR: BAM index missing."
+    exit 1
+fi
+
+if [[ ! -s "${DUP_METRICS}" ]]; then
+    log "ERROR: Duplicate metrics missing."
+    exit 1
+fi
+
+if [[ ! -s "${VALIDATION}" ]]; then
+    log "ERROR: Validation output missing."
+    exit 1
+fi
+
+
+
+# FINAL OUTPUTS
+
+
+log "============================================================"
+log "GATK recovery completed successfully for ${SAMPLE}"
+log "============================================================"
+
+log "Deduplicated BAM:"
+log "${DEDUP_BAM}"
+
+log "BAM index:"
+log "${DEDUP_BAI}"
+
+log "Duplicate metrics:"
+log "${DUP_METRICS}"
+
+log "Validation:"
+log "${VALIDATION}"
+
+log "============================================================"
+log "SUCCESS: ${SAMPLE}"
+log "============================================================"
