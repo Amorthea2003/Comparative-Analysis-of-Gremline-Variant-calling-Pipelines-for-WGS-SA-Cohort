@@ -1,0 +1,90 @@
+#!/bin/bash
+#PBS -N ALLELE_OVERLAP
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+OUT="/stor6/scratch3/27777197/gnomad_compare"
+TABLES="$OUT/tables"
+SORTED="$OUT/sorted"
+SORTTMP="$OUT/sort_tmp"
+
+mkdir -p "$TABLES" "$SORTED" "$SORTTMP"
+cd "$TABLES"
+
+export LC_ALL=C
+
+echo "Starting allele overlap comparison: $(date)"
+
+# Sort and deduplicate exact allele keys for each workflow.
+for CALLER in GATK DeepVariant DRAGEN_GATK; do
+    echo "Sorting $CALLER: $(date)"
+
+    sort -S 8G -T "$SORTTMP" -u \
+        "$TABLES/${CALLER}.alleles.tsv" \
+        -o "$SORTED/${CALLER}.unique.sorted.tsv"
+
+    echo "$CALLER unique exact allele keys:"
+    wc -l "$SORTED/${CALLER}.unique.sorted.tsv"
+done
+
+G="$SORTED/GATK.unique.sorted.tsv"
+D="$SORTED/DeepVariant.unique.sorted.tsv"
+R="$SORTED/DRAGEN_GATK.unique.sorted.tsv"
+
+echo "Calculating pairwise overlaps..."
+
+comm -12 "$G" "$D" > "$SORTED/GATK_DeepVariant.shared.tsv"
+comm -12 "$G" "$R" > "$SORTED/GATK_DRAGEN_GATK.shared.tsv"
+comm -12 "$D" "$R" > "$SORTED/DeepVariant_DRAGEN_GATK.shared.tsv"
+
+echo "Calculating three-way overlap..."
+
+comm -12 "$SORTED/GATK_DeepVariant.shared.tsv" "$R" \
+    > "$SORTED/all_three.shared.tsv"
+
+echo "Calculating caller-specific alleles..."
+
+sort -S 8G -T "$SORTTMP" -u "$D" "$R" \
+    -o "$SORTED/DeepVariant_DRAGEN_GATK.union.tsv"
+
+sort -S 8G -T "$SORTTMP" -u "$G" "$R" \
+    -o "$SORTED/GATK_DRAGEN_GATK.union.tsv"
+
+sort -S 8G -T "$SORTTMP" -u "$G" "$D" \
+    -o "$SORTED/GATK_DeepVariant.union.tsv"
+
+comm -23 "$G" "$SORTED/DeepVariant_DRAGEN_GATK.union.tsv" \
+    > "$SORTED/GATK.only.tsv"
+
+comm -23 "$D" "$SORTED/GATK_DRAGEN_GATK.union.tsv" \
+    > "$SORTED/DeepVariant.only.tsv"
+
+comm -23 "$R" "$SORTED/GATK_DeepVariant.union.tsv" \
+    > "$SORTED/DRAGEN_GATK.only.tsv"
+
+# Create an Excel-friendly summary.
+{
+    printf "Metric\tAllele_count\n"
+    printf "GATK_unique_alleles\t%s\n" "$(wc -l < "$G")"
+    printf "DeepVariant_unique_alleles\t%s\n" "$(wc -l < "$D")"
+    printf "DRAGEN_GATK_unique_alleles\t%s\n" "$(wc -l < "$R")"
+    printf "GATK_and_DeepVariant_shared\t%s\n" \
+        "$(wc -l < "$SORTED/GATK_DeepVariant.shared.tsv")"
+    printf "GATK_and_DRAGEN_GATK_shared\t%s\n" \
+        "$(wc -l < "$SORTED/GATK_DRAGEN_GATK.shared.tsv")"
+    printf "DeepVariant_and_DRAGEN_GATK_shared\t%s\n" \
+        "$(wc -l < "$SORTED/DeepVariant_DRAGEN_GATK.shared.tsv")"
+    printf "Shared_by_all_three\t%s\n" \
+        "$(wc -l < "$SORTED/all_three.shared.tsv")"
+    printf "GATK_only\t%s\n" "$(wc -l < "$SORTED/GATK.only.tsv")"
+    printf "DeepVariant_only\t%s\n" "$(wc -l < "$SORTED/DeepVariant.only.tsv")"
+    printf "DRAGEN_GATK_only\t%s\n" "$(wc -l < "$SORTED/DRAGEN_GATK.only.tsv")"
+} > "$TABLES/allele_overlap_summary.tsv"
+
+echo "Summary:"
+cat "$TABLES/allele_overlap_summary.tsv"
+
+echo "Completed: $(date)"

@@ -1,0 +1,437 @@
+#!/bin/bash
+#PBS -N DRAGEN_METRICS
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/bcftools/1.19
+
+BASE="/stor6/scratch3/27777197"
+
+VCF="${BASE}/dragen_gatk_cohort/filtering/dragen_gatk_hardfiltered_PASS.vcf.gz"
+OUT="${BASE}/dragen_gatk_cohort/metrics"
+
+mkdir -p "${OUT}"
+
+echo "=============================================="
+echo "DRAGEN-GATK FINAL METRICS"
+echo "=============================================="
+echo "Start: $(date)"
+echo "VCF: ${VCF}"
+echo "Output: ${OUT}"
+echo
+
+
+# CHECK VCF
+
+
+if [[ ! -s "${VCF}" ]]; then
+    echo "ERROR: VCF not found:"
+    echo "${VCF}"
+    exit 1
+fi
+
+if [[ ! -s "${VCF}.tbi" && ! -s "${VCF}.csi" ]]; then
+    echo "ERROR: VCF index not found"
+    exit 1
+fi
+
+echo "VCF and index found."
+
+
+# SAMPLE COUNT
+
+
+echo
+echo "===== SAMPLE COUNT ====="
+
+bcftools query -l "${VCF}" > "${OUT}/samples.txt"
+
+SAMPLE_COUNT=$(wc -l < "${OUT}/samples.txt")
+
+echo "${SAMPLE_COUNT}" > "${OUT}/sample_count.txt"
+
+echo "Samples: ${SAMPLE_COUNT}"
+
+if [[ "${SAMPLE_COUNT}" -ne 44 ]]; then
+    echo "ERROR: Expected 44 samples."
+    exit 1
+fi
+
+
+# TOTAL VARIANTS
+
+
+echo
+echo "===== TOTAL VARIANTS ====="
+
+TOTAL=$(bcftools index -n "${VCF}")
+
+echo "${TOTAL}" > "${OUT}/total_variants.txt"
+
+echo "Total variants: ${TOTAL}"
+
+
+# SNP COUNT
+
+
+echo
+echo "===== SNP COUNT ====="
+
+bcftools view -H -v snps "${VCF}" | wc -l > "${OUT}/snp_count.txt"
+
+cat "${OUT}/snp_count.txt"
+
+
+# INDEL COUNT
+
+
+echo
+echo "===== INDEL COUNT ====="
+
+bcftools view -H -v indels "${VCF}" | wc -l > "${OUT}/indel_count.txt"
+
+cat "${OUT}/indel_count.txt"
+
+
+# SNP / INDEL RATIO
+
+
+echo
+echo "===== SNP / INDEL RATIO ====="
+
+SNP=$(cat "${OUT}/snp_count.txt")
+INDEL=$(cat "${OUT}/indel_count.txt")
+
+awk -v snp="${SNP}" -v indel="${INDEL}" \
+'BEGIN {
+    if (indel > 0)
+        printf "%.6f\n", snp/indel
+    else
+        print "NA"
+}' > "${OUT}/snp_indel_ratio.txt"
+
+cat "${OUT}/snp_indel_ratio.txt"
+
+
+# MULTIALLELIC COUNT
+
+
+echo
+echo "===== MULTIALLELIC COUNT ====="
+
+bcftools view -H -m3 "${VCF}" | wc -l > "${OUT}/multiallelic_count.txt"
+
+MULTI=$(cat "${OUT}/multiallelic_count.txt")
+
+echo "Multiallelic variants: ${MULTI}"
+
+awk -v multi="${MULTI}" -v total="${TOTAL}" \
+'BEGIN {
+    printf "%.6f\n", 100*multi/total
+}' > "${OUT}/multiallelic_percent.txt"
+
+echo "Multiallelic percent:"
+cat "${OUT}/multiallelic_percent.txt"
+
+
+# BIALLELIC COUNT
+
+
+echo
+echo "===== BIALLELIC COUNT ====="
+
+bcftools view -H -m2 -M2 "${VCF}" | wc -l \
+    > "${OUT}/biallelic_count.txt"
+
+cat "${OUT}/biallelic_count.txt"
+
+
+# Ti/Tv
+
+
+echo
+echo "===== Ti/Tv ====="
+
+bcftools stats "${VCF}" > "${OUT}/bcftools_stats.txt"
+
+awk '$1=="TSTV" && $2==0' \
+    "${OUT}/bcftools_stats.txt" \
+    > "${OUT}/titv.txt"
+
+cat "${OUT}/titv.txt"
+
+
+# QUAL
+
+
+echo
+echo "===== QUAL ====="
+
+bcftools query -f '%QUAL\n' "${VCF}" |
+awk '
+$1 != "." {
+    q=$1+0
+
+    n++
+    sum+=q
+
+    if (q>=10)  ge10++
+    if (q>=20)  ge20++
+    if (q>=30)  ge30++
+    if (q>=50)  ge50++
+    if (q>=100) ge100++
+}
+END {
+    print "N\t" n
+    printf "MEAN\t%.6f\n", sum/n
+    print "GE10\t" ge10
+    print "GE20\t" ge20
+    print "GE30\t" ge30
+    print "GE50\t" ge50
+    print "GE100\t" ge100
+}' > "${OUT}/QUAL_summary.txt"
+
+cat "${OUT}/QUAL_summary.txt"
+
+
+# GENOTYPE COUNTS
+
+
+echo
+echo "===== GENOTYPE COUNTS ====="
+
+bcftools query -f '[%GT\t]\n' "${VCF}" |
+awk '
+{
+    for (i=1; i<=NF; i++) {
+
+        gt=$i
+        gsub(/\|/,"/",gt)
+
+        total++
+
+        if (gt=="./." || gt==".")
+            missing++
+
+        else if (gt=="0/0")
+            homref++
+
+        else if (gt=="0/1" || gt=="1/0")
+            het++
+
+        else if (gt=="1/1")
+            homalt++
+
+        else
+            other++
+    }
+}
+
+END {
+    print "TOTAL\t" total
+    print "MISSING\t" missing
+    print "HOM_REF\t" homref
+    print "HET\t" het
+    print "HOM_ALT\t" homalt
+    print "OTHER\t" other
+}' > "${OUT}/genotype_counts.txt"
+
+cat "${OUT}/genotype_counts.txt"
+
+
+# HET / HOM RATIO
+
+
+echo
+echo "===== HET / HOM RATIO ====="
+
+HET=$(awk '$1=="HET"{print $2}' "${OUT}/genotype_counts.txt")
+HOMALT=$(awk '$1=="HOM_ALT"{print $2}' "${OUT}/genotype_counts.txt")
+
+awk -v het="${HET}" -v hom="${HOMALT}" \
+'BEGIN {
+    if (hom > 0)
+        printf "%.6f\n", het/hom
+    else
+        print "NA"
+}' > "${OUT}/het_hom_ratio.txt"
+
+cat "${OUT}/het_hom_ratio.txt"
+
+
+# MISSINGNESS
+
+
+echo
+echo "===== MISSINGNESS ====="
+
+TOTAL_GT=$(awk '$1=="TOTAL"{print $2}' "${OUT}/genotype_counts.txt")
+MISSING=$(awk '$1=="MISSING"{print $2}' "${OUT}/genotype_counts.txt")
+
+awk -v total="${TOTAL_GT}" -v missing="${MISSING}" \
+'BEGIN {
+    printf "Total_genotypes\t%d\n", total
+    printf "Missing_genotypes\t%d\n", missing
+    printf "Missingness_percent\t%.8f\n", 100*missing/total
+}' > "${OUT}/missingness.txt"
+
+cat "${OUT}/missingness.txt"
+
+
+# DP
+
+
+echo
+echo "===== DP ====="
+
+bcftools query -f '[%DP\n]' "${VCF}" |
+awk '
+$1 != "." && $1 >= 0 {
+
+    dp=$1+0
+
+    n++
+    sum+=dp
+
+    if (dp>=5)  ge5++
+    if (dp>=10) ge10++
+    if (dp>=15) ge15++
+    if (dp>=20) ge20++
+}
+END {
+    print "N\t" n
+    printf "MEAN\t%.6f\n", sum/n
+    print "GE5\t" ge5
+    print "GE10\t" ge10
+    print "GE15\t" ge15
+    print "GE20\t" ge20
+}' > "${OUT}/DP_summary.txt"
+
+cat "${OUT}/DP_summary.txt"
+
+
+# GQ
+
+
+echo
+echo "===== GQ ====="
+
+bcftools query -f '[%GQ\n]' "${VCF}" |
+awk '
+$1 != "." && $1 >= 0 {
+
+    gq=$1+0
+
+    n++
+    sum+=gq
+
+    if (gq>=10) ge10++
+    if (gq>=20) ge20++
+    if (gq>=30) ge30++
+    if (gq>=50) ge50++
+}
+END {
+    print "N\t" n
+    printf "MEAN\t%.6f\n", sum/n
+    print "GE10\t" ge10
+    print "GE20\t" ge20
+    print "GE30\t" ge30
+    print "GE50\t" ge50
+}' > "${OUT}/GQ_summary.txt"
+
+cat "${OUT}/GQ_summary.txt"
+
+
+# PER-SAMPLE GENOTYPE METRICS
+
+
+echo
+echo "===== PER-SAMPLE GENOTYPE METRICS ====="
+
+bcftools query -f '[%GT\t]\n' "${VCF}" |
+awk '
+{
+    for (i=1; i<=NF; i++) {
+
+        gt=$i
+        gsub(/\|/,"/",gt)
+
+        total[i]++
+
+        if (gt=="./." || gt==".")
+            missing[i]++
+
+        else if (gt=="0/0")
+            homref[i]++
+
+        else if (gt=="0/1" || gt=="1/0")
+            het[i]++
+
+        else if (gt=="1/1")
+            homalt[i]++
+
+        else
+            other[i]++
+    }
+}
+
+END {
+    for (i=1; i<=44; i++) {
+
+        printf "%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+            i,
+            total[i],
+            homref[i],
+            het[i],
+            homalt[i],
+            missing[i],
+            other[i]
+    }
+}' > "${OUT}/per_sample_genotypes_raw.tsv"
+
+paste \
+    "${OUT}/samples.txt" \
+    "${OUT}/per_sample_genotypes_raw.tsv" |
+awk '
+BEGIN {
+    print "SAMPLE\tINDEX\tTOTAL\tHOM_REF\tHET\tHOM_ALT\tMISSING\tOTHER"
+}
+{
+    print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8
+}' > "${OUT}/per_sample_genotypes.tsv"
+
+rm -f "${OUT}/per_sample_genotypes_raw.tsv"
+
+
+# FINAL SUMMARY
+
+
+echo
+echo "===== FINAL DRAGEN-GATK SUMMARY ====="
+
+{
+    echo -e "Metric\tValue"
+    echo -e "Samples\t${SAMPLE_COUNT}"
+    echo -e "Total_variants\t${TOTAL}"
+    echo -e "SNPs\t${SNP}"
+    echo -e "INDELs\t${INDEL}"
+    echo -e "SNP_INDEL_ratio\t$(cat "${OUT}/snp_indel_ratio.txt")"
+    echo -e "Biallelic\t$(cat "${OUT}/biallelic_count.txt")"
+    echo -e "Multiallelic\t${MULTI}"
+    echo -e "Multiallelic_percent\t$(cat "${OUT}/multiallelic_percent.txt")"
+    echo -e "Het_HomALT_ratio\t$(cat "${OUT}/het_hom_ratio.txt")"
+} > "${OUT}/summary.tsv"
+
+cat "${OUT}/summary.tsv"
+
+echo
+echo "=============================================="
+echo "DRAGEN-GATK METRICS COMPLETE"
+echo "=============================================="
+echo "End: $(date)"
+echo "Output:"
+echo "${OUT}"

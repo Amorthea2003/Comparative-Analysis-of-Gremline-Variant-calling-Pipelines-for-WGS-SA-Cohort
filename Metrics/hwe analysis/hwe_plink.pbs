@@ -1,0 +1,95 @@
+#!/bin/bash
+#PBS -N HWE_PLINK
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=48:00:00
+#PBS -o ~/Variantcalling/metrics/hwe_plink.log
+#PBS -e ~/Variantcalling/metrics/hwe_plink.log
+
+set -euo pipefail
+
+module load app/plink/2.0
+
+BASE=/stor6/scratch3/27777197
+OUT=~/Variantcalling/metrics/hwe_plink
+
+GATK="$BASE/gatk_cohort/filtering/gatk_hardfiltered_PASS.vcf.gz"
+DV="$BASE/deepvariant_cohort/output/deepvariant_joint.vcf.gz"
+DRAGEN="$BASE/dragen_gatk_cohort/filtering/dragen_gatk_hardfiltered_PASS.vcf.gz"
+
+mkdir -p "$OUT"
+
+echo "========================================"
+echo "Hardy-Weinberg Equilibrium Analysis"
+echo "Started: $(date)"
+echo "Samples: 44"
+echo "Threshold: P < 1e-6"
+echo "========================================"
+
+run_hwe () {
+
+    NAME="$1"
+    VCF="$2"
+
+    echo
+    echo "Processing $NAME"
+    echo "VCF: $VCF"
+
+    PREFIX="$OUT/$NAME"
+
+    # Convert VCF to PLINK 2 binary format
+    plink2 \
+        --vcf "$VCF" \
+        --double-id \
+        --allow-extra-chr \
+        --make-pgen \
+        --out "$PREFIX"
+
+    # HWE test across all 44 samples
+    plink2 \
+        --pfile "$PREFIX" \
+        --hardy \
+        --out "${PREFIX}_hwe"
+
+    # Count variants tested
+    TOTAL=$(awk 'NR>1 && $1!="CHR" {n++} END{print n+0}' \
+        "${PREFIX}_hwe.hardy")
+
+    # Count variants with HWE P < 1e-6
+    FLAGGED=$(awk '
+        NR > 1 && $1 != "CHR" && $NF != "NA" && $NF < 1e-6 {n++}
+        END {print n+0}
+    ' "${PREFIX}_hwe.hardy")
+
+    # Calculate percentage
+    RATE=$(awk -v f="$FLAGGED" -v t="$TOTAL" \
+        'BEGIN {if(t>0) printf "%.8f", (f/t)*100; else print "NA"}')
+
+    {
+        echo -e "Pipeline\tTotal_variants_tested\tHWE_deviant_P_lt_1e-6\tHWE_deviation_percent"
+        echo -e "$NAME\t$TOTAL\t$FLAGGED\t$RATE"
+    } > "${PREFIX}_summary.tsv"
+
+    echo "Total variants tested: $TOTAL"
+    echo "HWE-deviant sites (P < 1e-6): $FLAGGED"
+    echo "HWE deviation rate (%): $RATE"
+}
+
+run_hwe "GATK" "$GATK"
+run_hwe "DeepVariant" "$DV"
+run_hwe "DRAGEN-GATK" "$DRAGEN"
+
+# Combined summary
+echo -e "Pipeline\tTotal_variants_tested\tHWE_deviant_P_lt_1e-6\tHWE_deviation_percent" \
+    > "$OUT/HWE_summary.tsv"
+
+tail -n +2 "$OUT/GATK_summary.tsv" >> "$OUT/HWE_summary.tsv"
+tail -n +2 "$OUT/DeepVariant_summary.tsv" >> "$OUT/HWE_summary.tsv"
+tail -n +2 "$OUT/DRAGEN-GATK_summary.tsv" >> "$OUT/HWE_summary.tsv"
+
+echo
+echo "========================================"
+echo "HWE ANALYSIS COMPLETE"
+echo "Completed: $(date)"
+echo "========================================"
+
+cat "$OUT/HWE_summary.tsv"

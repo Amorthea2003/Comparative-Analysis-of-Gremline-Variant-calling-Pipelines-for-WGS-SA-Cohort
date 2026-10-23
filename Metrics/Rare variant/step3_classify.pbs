@@ -1,0 +1,12 @@
+#!/bin/bash
+#PBS -N classify
+#PBS -J 1-3
+#PBS -l select=1:ncpus=2:mem=48gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+set -euo pipefail
+SCR=/stor6/scratch3/27777197/rare
+CALLERS=(gatk dv dragen)
+c=${CALLERS[$((PBS_ARRAY_INDEX-1))]}
+zcat $SCR/${c}_alleles.tsv.gz | awk -F'\t' -v OFS='\t' -v cal=$c -f $HOME/Variantcalling/classify.awk $SCR/gn_chr*.tsv - > $SCR/counts_$c.tsv
+echo "done $c"

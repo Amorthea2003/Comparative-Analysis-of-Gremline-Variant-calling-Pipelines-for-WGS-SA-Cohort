@@ -1,0 +1,45 @@
+#!/bin/bash
+#PBS -N HWE_DV
+#PBS -l nodes=1:ppn=8
+#PBS -l mem=32gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+
+module load app/plink/2.0
+
+OUT="$HOME/Variantcalling/metrics/hwe_plink"
+VCF="/stor6/scratch3/27777197/deepvariant_cohort/output/deepvariant_joint.vcf.gz"
+PREFIX="$OUT/DeepVariant"
+
+mkdir -p "$OUT"
+
+CHR="chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22"
+
+echo "=== DeepVariant autosomal HWE ==="
+
+plink2 \
+  --vcf "$VCF" \
+  --vcf-half-call missing \
+  --chr "$CHR" \
+  --double-id \
+  --allow-extra-chr \
+  --make-pgen \
+  --out "$PREFIX"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: DeepVariant VCF conversion failed"
+    exit 1
+fi
+
+plink2 \
+  --pfile "$PREFIX" \
+  --hardy \
+  --out "$PREFIX"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: DeepVariant HWE calculation failed"
+    exit 1
+fi
+
+echo "DeepVariant HWE complete."
+echo "Output: $PREFIX.hardy"

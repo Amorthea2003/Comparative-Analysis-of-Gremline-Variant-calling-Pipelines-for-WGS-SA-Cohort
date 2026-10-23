@@ -1,0 +1,95 @@
+#!/bin/bash
+#PBS -N GNOMAD_PILOT
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=04:00:00
+#PBS -j oe
+
+set -euo pipefail
+module load app/bcftools/1.19
+
+REF="$HOME/Variantcalling/reference/hg38.fa"
+OUT="/stor6/scratch3/27777197/gnomad_compare"
+NORM="$OUT/normalized"
+PILOT="$OUT/pilot"
+mkdir -p "$PILOT"
+
+GNOMAD="https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/vcf/genomes/gnomad.genomes.v4.1.sites.chr1.vcf.bgz"
+GATK="$NORM/GATK.normalized.vcf.gz"
+
+echo "[$(date)] Extracting pilot variants"
+
+bcftools query -r chr1 \
+  -f '%CHROM\t%POS\t%REF\t%ALT\n' "$GATK" \
+  > "$PILOT/all_chr1_variants.tsv"
+
+awk 'BEGIN{FS=OFS="\t"}
+     !seen[$1,$2]++ {
+         print $1,$2
+         n++
+         if (n==1000) exit
+     }' "$PILOT/all_chr1_variants.tsv" \
+  > "$PILOT/pilot.positions.tsv"
+
+N=$(wc -l < "$PILOT/pilot.positions.tsv")
+echo "Pilot positions: $N"
+
+if [ "$N" -eq 0 ]; then
+    echo "ERROR: No chr1 positions extracted"
+    exit 1
+fi
+
+echo "[$(date)] Querying indexed gnomAD regions"
+
+bcftools view -R "$PILOT/pilot.positions.tsv" "$GNOMAD" -Ou \
+  | bcftools norm -f "$REF" -m -any -Ou \
+  | bcftools query \
+      -f '%CHROM\t%POS\t%REF\t%ALT\t%FILTER\t%AF_afr\t%AN_afr\n' \
+      > "$PILOT/pilot.gnomad.tsv"
+
+echo "[$(date)] Extracting GATK pilot alleles"
+
+bcftools query -r chr1 \
+  -f '%CHROM\t%POS\t%REF\t%ALT\n' "$GATK" \
+  | awk 'BEGIN{FS=OFS="\t"} NR==FNR {p[$1,$2]=1; next} p[$1,$2] {print}' \
+      "$PILOT/pilot.positions.tsv" - \
+  > "$PILOT/pilot.gatk.tsv"
+
+echo "[$(date)] Comparing exact alleles"
+
+awk '
+BEGIN {FS=OFS="\t"}
+FILENAME==ARGV[1] {
+    key=$1 SUBSEP $2 SUBSEP $3 SUBSEP $4
+    af[key]=$6
+    an[key]=$7
+    filt[key]=$5
+    next
+}
+{
+    key=$1 SUBSEP $2 SUBSEP $3 SUBSEP $4
+    total++
+    if (!(key in af)) {
+        absent++
+    } else if (an[key] == "." || an[key] == 0 || af[key] == ".") {
+        unavailable++
+    } else if (af[key] < 0.05 && af[key] >= 0) {
+        rare++
+    } else if (af[key] <= 1 && af[key] > 0) {
+        if (af[key] <= 0.95) common++
+        else rare++
+    } else {
+        unavailable++
+    }
+}
+END {
+    print "GATK pilot alleles:",total
+    print "Exact matches with usable AFR frequency:",common+rare
+    print "Common AFR alleles:",common
+    print "Rare AFR alleles:",rare
+    print "AFR frequency unavailable:",unavailable
+    print "Absent from queried gnomAD records:",absent
+}
+' "$PILOT/pilot.gnomad.tsv" "$PILOT/pilot.gatk.tsv" \
+  | tee "$PILOT/pilot.summary.txt"
+
+echo "[$(date)] Pilot finished"

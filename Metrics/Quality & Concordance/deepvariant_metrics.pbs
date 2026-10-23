@@ -1,0 +1,398 @@
+#!/bin/bash
+#PBS -N DV_METRICS
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/bcftools/1.19
+
+BASE="${HOME}/Variantcalling"
+
+# CHANGE THIS ONLY IF YOUR FINAL PASS VCF HAS A DIFFERENT NAME
+VCF="${HOME}/Variantcalling/deepvariant/deepvariant_joint.vcf.gz"
+
+OUT="${BASE}/metrics/deepvariant"
+
+mkdir -p "${OUT}"
+
+echo "=========================================="
+echo "DEEPVARIANT FINAL PASS METRICS"
+echo "=========================================="
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+echo "VCF: ${VCF}"
+echo "Output: ${OUT}"
+echo "=========================================="
+
+test -s "${VCF}"
+
+if [[ -s "${VCF}.tbi" ]]; then
+    echo "TBI index found."
+elif [[ -s "${VCF}.csi" ]]; then
+    echo "CSI index found."
+else
+    echo "ERROR: No VCF index found."
+    exit 1
+fi
+
+
+
+# 1. TOTAL VARIANTS
+
+
+echo
+echo "STEP 1: Total variants"
+
+bcftools index -n "${VCF}" \
+    | tee "${OUT}/total_variants.txt"
+
+
+
+# 2. SNP / INDEL COUNTS
+
+
+echo
+echo "STEP 2: SNP / INDEL counts"
+
+bcftools view -v snps -H "${VCF}" \
+    | wc -l \
+    | tee "${OUT}/snp_count.txt"
+
+bcftools view -v indels -H "${VCF}" \
+    | wc -l \
+    | tee "${OUT}/indel_count.txt"
+
+
+
+# 3. MULTIALLELIC VARIANTS
+
+
+echo
+echo "STEP 3: Multiallelic variants"
+
+bcftools view -m3 -H "${VCF}" \
+    | wc -l \
+    | tee "${OUT}/multiallelic_count.txt"
+
+
+
+# 4. Ti/Tv
+
+
+echo
+echo "STEP 4: Ti/Tv"
+
+bcftools stats "${VCF}" \
+    > "${OUT}/bcftools_stats.txt"
+
+grep "^TSTV" "${OUT}/bcftools_stats.txt" \
+    | tee "${OUT}/titv.txt"
+
+
+
+# 5. HET / HOM
+
+
+echo
+echo "STEP 5: Genotype counts"
+
+bcftools query -f '[%GT\n]' "${VCF}" \
+    | awk '
+    BEGIN {
+        HOM_REF=0
+        HET=0
+        HOM_ALT=0
+        MISSING=0
+        OTHER=0
+    }
+
+    $1=="0/0" || $1=="0|0" {
+        HOM_REF++
+        next
+    }
+
+    $1=="./." || $1==".|." {
+        MISSING++
+        next
+    }
+
+    {
+        split($1,a,/[/|]/)
+
+        if (a[1]=="." || a[2]==".") {
+            MISSING++
+        }
+        else if (a[1]!=a[2]) {
+            HET++
+        }
+        else if (a[1]==a[2] && a[1]!="0") {
+            HOM_ALT++
+        }
+        else {
+            OTHER++
+        }
+    }
+
+    END {
+        printf "HOM_REF\t%d\n",HOM_REF
+        printf "HET\t%d\n",HET
+        printf "HOM_ALT\t%d\n",HOM_ALT
+        printf "MISSING\t%d\n",MISSING
+        printf "OTHER\t%d\n",OTHER
+    }' \
+    | tee "${OUT}/genotype_counts.txt"
+
+
+
+# 6. MISSINGNESS
+
+
+echo
+echo "STEP 6: Missingness"
+
+TOTAL_GENOTYPES=$(
+    bcftools query -f '[%GT\n]' "${VCF}" | wc -l
+)
+
+MISSING_GENOTYPES=$(
+    bcftools query -f '[%GT\n]' "${VCF}" \
+        | awk '
+        {
+            split($1,a,/[/|]/)
+            if (a[1]=="." || a[2]==".")
+                n++
+        }
+        END {
+            print n+0
+        }'
+)
+
+MISSINGNESS=$(awk \
+    -v missing="${MISSING_GENOTYPES}" \
+    -v total="${TOTAL_GENOTYPES}" \
+    'BEGIN {
+        if (total > 0)
+            printf "%.8f\n", missing/total
+        else
+            print "NA"
+    }')
+
+{
+    echo -e "TOTAL_GENOTYPES\t${TOTAL_GENOTYPES}"
+    echo -e "MISSING_GENOTYPES\t${MISSING_GENOTYPES}"
+    echo -e "MISSINGNESS\t${MISSINGNESS}"
+} | tee "${OUT}/missingness.txt"
+
+
+
+# 7. QUAL DISTRIBUTION
+
+
+echo
+echo "STEP 7: QUAL distribution"
+
+bcftools query -f '%QUAL\n' "${VCF}" \
+    | awk '
+    $1!="." {
+        n++
+        sum+=$1
+
+        if (min=="" || $1<min)
+            min=$1
+
+        if (max=="" || $1>max)
+            max=$1
+    }
+
+    END {
+        if (n>0) {
+            printf "N\t%d\n",n
+            printf "MIN\t%.4f\n",min
+            printf "MEAN\t%.4f\n",sum/n
+            printf "MAX\t%.4f\n",max
+        }
+    }' \
+    | tee "${OUT}/QUAL_summary.txt"
+
+bcftools query -f '%QUAL\n' "${VCF}" \
+    > "${OUT}/QUAL_values.txt"
+
+
+
+# 8. GENOTYPE DP DISTRIBUTION
+
+
+echo
+echo "STEP 8: Genotype DP distribution"
+
+bcftools query -f '[%DP\n]' "${VCF}" \
+    | awk '$1!="."' \
+    > "${OUT}/DP_values.txt"
+
+awk '
+    {
+        n++
+        sum+=$1
+
+        if (min=="" || $1<min)
+            min=$1
+
+        if (max=="" || $1>max)
+            max=$1
+    }
+
+    END {
+        if (n>0) {
+            printf "N\t%d\n",n
+            printf "MIN\t%.4f\n",min
+            printf "MEAN\t%.4f\n",sum/n
+            printf "MAX\t%.4f\n",max
+        }
+    }' "${OUT}/DP_values.txt" \
+    | tee "${OUT}/DP_summary.txt"
+
+
+
+# 9. GENOTYPE GQ DISTRIBUTION
+
+
+echo
+echo "STEP 9: Genotype GQ distribution"
+
+bcftools query -f '[%GQ\n]' "${VCF}" \
+    | awk '$1!="."' \
+    > "${OUT}/GQ_values.txt"
+
+awk '
+    {
+        n++
+        sum+=$1
+
+        if (min=="" || $1<min)
+            min=$1
+
+        if (max=="" || $1>max)
+            max=$1
+    }
+
+    END {
+        if (n>0) {
+            printf "N\t%d\n",n
+            printf "MIN\t%.4f\n",min
+            printf "MEAN\t%.4f\n",sum/n
+            printf "MAX\t%.4f\n",max
+        }
+    }' "${OUT}/GQ_values.txt" \
+    | tee "${OUT}/GQ_summary.txt"
+
+
+
+# 10. PER-SAMPLE GENOTYPE METRICS
+
+
+echo
+echo "STEP 10: Per-sample metrics"
+
+bcftools query -l "${VCF}" \
+    > "${OUT}/samples.txt"
+
+echo -e "SAMPLE\tHOM_REF\tHET\tHOM_ALT\tMISSING\tTOTAL_GENOTYPES\tMISSINGNESS" \
+    > "${OUT}/per_sample_metrics.tsv"
+
+while read -r SAMPLE; do
+
+    bcftools query -s "${SAMPLE}" -f '[%GT\n]' "${VCF}" \
+        | awk -v sample="${SAMPLE}" '
+        {
+            total++
+
+            if ($1=="0/0" || $1=="0|0") {
+                homref++
+            }
+            else if ($1=="./." || $1==".|.") {
+                missing++
+            }
+            else {
+                split($1,a,/[/|]/)
+
+                if (a[1]=="." || a[2]==".") {
+                    missing++
+                }
+                else if (a[1]!=a[2]) {
+                    het++
+                }
+                else if (a[1]==a[2] && a[1]!="0") {
+                    homalt++
+                }
+            }
+        }
+
+        END {
+            if (total > 0)
+                miss_rate=missing/total
+            else
+                miss_rate=0
+
+            printf "%s\t%d\t%d\t%d\t%d\t%d\t%.8f\n",
+                sample,
+                homref,
+                het,
+                homalt,
+                missing,
+                total,
+                miss_rate
+        }' \
+        >> "${OUT}/per_sample_metrics.tsv"
+
+done < "${OUT}/samples.txt"
+
+
+
+# 11. SAMPLE COUNT
+
+
+echo
+echo "STEP 11: Sample count"
+
+wc -l < "${OUT}/samples.txt" \
+    | tee "${OUT}/sample_count.txt"
+
+
+
+# 12. VALIDATION
+
+
+echo
+echo "STEP 12: Validation"
+
+SAMPLES=$(wc -l < "${OUT}/samples.txt")
+VARIANTS=$(bcftools index -n "${VCF}")
+
+if [[ "${SAMPLES}" -ne 44 ]]; then
+    echo "ERROR: Expected 44 samples, found ${SAMPLES}"
+    exit 1
+fi
+
+echo "Samples: ${SAMPLES}"
+echo "Variants: ${VARIANTS}"
+
+bcftools view -h "${VCF}" > /dev/null
+
+echo "VCF readability: PASS"
+echo "Sample count: PASS"
+
+
+
+# COMPLETE
+
+
+echo
+echo "=========================================="
+echo "DEEPVARIANT METRICS COMPLETE"
+echo "=========================================="
+echo "Finished: $(date)"
+echo "Results: ${OUT}"
+echo "=========================================="

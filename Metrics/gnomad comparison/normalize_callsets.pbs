@@ -1,0 +1,46 @@
+#!/bin/bash
+#PBS -N GNOMAD_NORM
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+module load app/bcftools/1.19
+
+REF="$HOME/Variantcalling/reference/hg38.fa"
+OUT="/stor6/scratch3/27777197/gnomad_compare/normalized"
+mkdir -p "$OUT"
+
+normalize_vcf() {
+    local name="$1"
+    local input="$2"
+    local output="$OUT/${name}.normalized.vcf.gz"
+
+    echo "[$(date)] Starting $name"
+
+    bcftools norm \
+        -f "$REF" \
+        -m -any \
+        -Ou "$input" \
+    | bcftools view \
+        -G \
+        -Oz \
+        -o "$output"
+
+    bcftools index -f -c "$output"
+
+    echo "[$(date)] Completed $name"
+    bcftools view -H "$output" | wc -l
+}
+
+normalize_vcf GATK \
+  /stor6/scratch3/27777197/gatk_cohort/filtering/gatk_hardfiltered_PASS.vcf.gz
+
+normalize_vcf DeepVariant \
+  /stor6/scratch3/27777197/deepvariant_cohort/output/deepvariant_joint.vcf.gz
+
+normalize_vcf DRAGEN_GATK \
+  /stor6/scratch3/27777197/dragen_gatk_cohort/filtering/dragen_gatk_hardfiltered_PASS.vcf.gz
+
+echo "All three callsets normalized successfully."

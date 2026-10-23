@@ -1,0 +1,309 @@
+#!/bin/bash
+#PBS -N DB_CONCORDANCE
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+#PBS -o /home/27777197/Variantcalling/metrics/database_concordance_metrics.log
+
+set -euo pipefail
+
+module load app/bcftools/1.19
+
+REF="/home/27777197/Variantcalling/reference/hg38.fa"
+DBSNP="/home/27777197/Variantcalling/reference/bqsr/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+
+GATK="/stor6/scratch3/27777197/gatk_cohort/filtering/gatk_hardfiltered_PASS.vcf.gz"
+DV="/stor6/scratch3/27777197/deepvariant_cohort/output/deepvariant_joint.vcf.gz"
+DRAGEN="/stor6/scratch3/27777197/dragen_gatk_cohort/filtering/dragen_gatk_hardfiltered_PASS.vcf.gz"
+
+OUT="/home/27777197/Variantcalling/metrics/database_concordance"
+
+mkdir -p "$OUT"
+mkdir -p "$OUT/normalized"
+mkdir -p "$OUT/dbsnp"
+
+echo "============================================================"
+echo "DATABASE CONCORDANCE AND VARIANT OVERLAP ANALYSIS"
+echo "============================================================"
+echo "Started: $(date)"
+echo
+
+
+# Primary chromosomes
+
+
+CHROMS="chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX,chrY"
+
+
+# Function: normalize and create unique variant keys
+
+
+prepare_vcf () {
+
+    NAME="$1"
+    VCF="$2"
+
+    echo "------------------------------------------------------------"
+    echo "Preparing $NAME"
+    echo "------------------------------------------------------------"
+
+    bcftools view \
+        -r "$CHROMS" \
+        -v snps,indels \
+        -Ou \
+        "$VCF" \
+    | bcftools norm \
+        -f "$REF" \
+        -m -any \
+        -Ou \
+    | bcftools sort \
+        -Oz \
+        -o "$OUT/normalized/${NAME}.vcf.gz"
+
+    bcftools index -t "$OUT/normalized/${NAME}.vcf.gz"
+
+    # Create exact variant keys:
+    # CHROM:POS:REF:ALT
+
+    bcftools query \
+        -f '%CHROM\t%POS\t%REF\t%ALT\n' \
+        "$OUT/normalized/${NAME}.vcf.gz" \
+    | awk 'BEGIN{OFS=":"} {print $1,$2,$3,$4}' \
+    | sort -u \
+    > "$OUT/normalized/${NAME}.keys"
+
+    COUNT=$(wc -l < "$OUT/normalized/${NAME}.keys")
+
+    echo "$NAME normalized unique variants: $COUNT"
+    echo
+}
+
+prepare_vcf "GATK" "$GATK"
+prepare_vcf "DeepVariant" "$DV"
+prepare_vcf "DRAGEN-GATK" "$DRAGEN"
+
+
+# Total variant counts
+
+
+GATK_N=$(wc -l < "$OUT/normalized/GATK.keys")
+DV_N=$(wc -l < "$OUT/normalized/DeepVariant.keys")
+DRAGEN_N=$(wc -l < "$OUT/normalized/DRAGEN-GATK.keys")
+
+
+# dbSNP-known variants
+
+
+echo "============================================================"
+echo "DBSNP ANALYSIS"
+echo "============================================================"
+
+for P in GATK DeepVariant DRAGEN-GATK; do
+
+    echo "Checking dbSNP for $P..."
+
+    bcftools annotate \
+        -a "$DBSNP" \
+        -c ID \
+        -Oz \
+        -o "$OUT/dbsnp/${P}_annotated.vcf.gz" \
+        "$OUT/normalized/${P}.vcf.gz"
+
+    bcftools index -t "$OUT/dbsnp/${P}_annotated.vcf.gz"
+
+    TOTAL=$(bcftools view -H \
+        "$OUT/dbsnp/${P}_annotated.vcf.gz" \
+        | wc -l)
+
+    KNOWN=$(bcftools view \
+        -H \
+        -i 'ID!="."' \
+        "$OUT/dbsnp/${P}_annotated.vcf.gz" \
+        | wc -l)
+
+    NOVEL=$(bcftools view \
+        -H \
+        -i 'ID=="."' \
+        "$OUT/dbsnp/${P}_annotated.vcf.gz" \
+        | wc -l)
+
+    RATE=$(awk -v k="$KNOWN" -v t="$TOTAL" \
+        'BEGIN{if(t>0) printf "%.6f",100*k/t; else print "NA"}')
+
+    echo -e "$P\t$TOTAL\t$KNOWN\t$NOVEL\t$RATE"
+
+done > "$OUT/dbsnp_summary.tsv"
+
+
+# Pairwise intersections
+
+
+echo
+echo "============================================================"
+echo "PAIRWISE OVERLAP"
+echo "============================================================"
+
+GATK_DV=$(comm -12 \
+    "$OUT/normalized/GATK.keys" \
+    "$OUT/normalized/DeepVariant.keys" \
+    | wc -l)
+
+GATK_DRAGEN=$(comm -12 \
+    "$OUT/normalized/GATK.keys" \
+    "$OUT/normalized/DRAGEN-GATK.keys" \
+    | wc -l)
+
+DV_DRAGEN=$(comm -12 \
+    "$OUT/normalized/DeepVariant.keys" \
+    "$OUT/normalized/DRAGEN-GATK.keys" \
+    | wc -l)
+
+GATK_DV_UNION=$(comm -3 \
+    "$OUT/normalized/GATK.keys" \
+    "$OUT/normalized/DeepVariant.keys" \
+    | wc -l)
+
+# comm -3 = symmetric difference
+# union = A + B - intersection
+
+GATK_DV_UNION=$((GATK_N + DV_N - GATK_DV))
+GATK_DRAGEN_UNION=$((GATK_N + DRAGEN_N - GATK_DRAGEN))
+DV_DRAGEN_UNION=$((DV_N + DRAGEN_N - DV_DRAGEN))
+
+GATK_DV_J=$(awk -v i="$GATK_DV" -v u="$GATK_DV_UNION" \
+    'BEGIN{printf "%.6f",100*i/u}')
+
+GATK_DRAGEN_J=$(awk -v i="$GATK_DRAGEN" -v u="$GATK_DRAGEN_UNION" \
+    'BEGIN{printf "%.6f",100*i/u}')
+
+DV_DRAGEN_J=$(awk -v i="$DV_DRAGEN" -v u="$DV_DRAGEN_UNION" \
+    'BEGIN{printf "%.6f",100*i/u}')
+
+
+# Three-way intersection
+
+
+THREE_WAY=$(comm -12 \
+    <(comm -12 \
+        "$OUT/normalized/GATK.keys" \
+        "$OUT/normalized/DeepVariant.keys") \
+    "$OUT/normalized/DRAGEN-GATK.keys" \
+    | wc -l)
+
+
+# Union of all three
+
+
+cat \
+    "$OUT/normalized/GATK.keys" \
+    "$OUT/normalized/DeepVariant.keys" \
+    "$OUT/normalized/DRAGEN-GATK.keys" \
+| sort -u \
+> "$OUT/all_three_union.keys"
+
+THREE_UNION=$(wc -l < "$OUT/all_three_union.keys")
+
+
+# Caller-unique variants
+
+
+GATK_SHARED=$(cat \
+    "$OUT/normalized/DeepVariant.keys" \
+    "$OUT/normalized/DRAGEN-GATK.keys" \
+| sort -u)
+
+DV_SHARED=$(cat \
+    "$OUT/normalized/GATK.keys" \
+    "$OUT/normalized/DRAGEN-GATK.keys" \
+| sort -u)
+
+DRAGEN_SHARED=$(cat \
+    "$OUT/normalized/GATK.keys" \
+    "$OUT/normalized/DeepVariant.keys" \
+| sort -u)
+
+GATK_UNIQUE=$(comm -23 \
+    "$OUT/normalized/GATK.keys" \
+    <(printf "%s\n" "$GATK_SHARED" | sort -u) \
+    | wc -l)
+
+DV_UNIQUE=$(comm -23 \
+    "$OUT/normalized/DeepVariant.keys" \
+    <(printf "%s\n" "$DV_SHARED" | sort -u) \
+    | wc -l)
+
+DRAGEN_UNIQUE=$(comm -23 \
+    "$OUT/normalized/DRAGEN-GATK.keys" \
+    <(printf "%s\n" "$DRAGEN_SHARED" | sort -u) \
+    | wc -l)
+
+
+# Percentages
+
+
+GATK_UNIQUE_PCT=$(awk -v x="$GATK_UNIQUE" -v n="$GATK_N" \
+    'BEGIN{printf "%.6f",100*x/n}')
+
+DV_UNIQUE_PCT=$(awk -v x="$DV_UNIQUE" -v n="$DV_N" \
+    'BEGIN{printf "%.6f",100*x/n}')
+
+DRAGEN_UNIQUE_PCT=$(awk -v x="$DRAGEN_UNIQUE" -v n="$DRAGEN_N" \
+    'BEGIN{printf "%.6f",100*x/n}')
+
+
+# Variant overlap summary
+
+
+cat > "$OUT/variant_overlap_summary.tsv" <<SUMMARY
+MetricGATKDeepVariantDRAGEN-GATK
+Normalized_unique_variants$GATK_N$DV_N$DRAGEN_N
+Three_caller_overlap$THREE_WAY$THREE_WAY$THREE_WAY
+Caller_unique_variants$GATK_UNIQUE$DV_UNIQUE$DRAGEN_UNIQUE
+Caller_unique_percent$GATK_UNIQUE_PCT$DV_UNIQUE_PCT$DRAGEN_UNIQUE_PCT
+SUMMARY
+
+cat > "$OUT/pairwise_concordance.tsv" <<PAIR
+PairShared_variantsUnion_variantsJaccard_percent
+GATK_vs_DeepVariant$GATK_DV$GATK_DV_UNION$GATK_DV_J
+GATK_vs_DRAGEN-GATK$GATK_DRAGEN$GATK_DRAGEN_UNION$GATK_DRAGEN_J
+DeepVariant_vs_DRAGEN-GATK$DV_DRAGEN$DV_DRAGEN_UNION$DV_DRAGEN_J
+PAIR
+
+cat > "$OUT/three_caller_summary.tsv" <<THREE
+MetricValue
+GATK_variants$GATK_N
+DeepVariant_variants$DV_N
+DRAGEN-GATK_variants$DRAGEN_N
+Three_caller_overlap$THREE_WAY
+Three_caller_union$THREE_UNION
+GATK_unique$GATK_UNIQUE
+DeepVariant_unique$DV_UNIQUE
+DRAGEN-GATK_unique$DRAGEN_UNIQUE
+THREE
+
+
+# Final output
+
+
+echo
+echo "============================================================"
+echo "DBSNP SUMMARY"
+echo "============================================================"
+cat "$OUT/dbsnp_summary.tsv"
+
+echo
+echo "============================================================"
+echo "PAIRWISE CONCORDANCE"
+echo "============================================================"
+cat "$OUT/pairwise_concordance.tsv"
+
+echo
+echo "============================================================"
+echo "THREE-CALLER SUMMARY"
+echo "============================================================"
+cat "$OUT/three_caller_summary.tsv"
+
+echo
+echo "============================================================"
+echo "Completed: $(date)"
+echo "============================================================"

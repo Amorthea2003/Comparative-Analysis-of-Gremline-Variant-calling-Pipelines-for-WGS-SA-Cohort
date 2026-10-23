@@ -1,0 +1,313 @@
+#!/bin/bash
+#PBS -N DRAGEN_METRICS_POP
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/bcftools/1.19
+
+BASE="/stor6/scratch3/27777197"
+
+VCF="${BASE}/dragen_gatk_cohort/filtering/dragen_gatk_hardfiltered_PASS.vcf.gz"
+OUT="${BASE}/dragen_gatk_cohort/metrics_population"
+
+SAMPLE_DIR="${OUT}/sample_lists"
+SUBSET_DIR="${OUT}/subset_jvcfs"
+
+mkdir -p "${SAMPLE_DIR}" "${SUBSET_DIR}"
+
+echo "=========================================="
+echo "DRAGEN-GATK POPULATION METRICS"
+echo "Started: $(date)"
+echo "=========================================="
+
+
+# Population sample lists
+
+
+cat > "${SAMPLE_DIR}/African_3_samples.txt" <<EOF
+899
+1025
+1042
+EOF
+
+cat > "${SAMPLE_DIR}/European_2_samples.txt" <<EOF
+1756
+1064
+EOF
+
+bcftools query -l "${VCF}" \
+    | grep -Ev '^(899|1025|1042|1756|1064)$' \
+    > "${SAMPLE_DIR}/SAC_39_samples.txt"
+
+
+# Validate population counts
+
+
+AFRICAN_N=$(wc -l < "${SAMPLE_DIR}/African_3_samples.txt")
+EUROPEAN_N=$(wc -l < "${SAMPLE_DIR}/European_2_samples.txt")
+SAC_N=$(wc -l < "${SAMPLE_DIR}/SAC_39_samples.txt")
+
+[[ "${AFRICAN_N}" -eq 3 ]] || {
+    echo "ERROR: African count = ${AFRICAN_N}"
+    exit 1
+}
+
+[[ "${EUROPEAN_N}" -eq 2 ]] || {
+    echo "ERROR: European count = ${EUROPEAN_N}"
+    exit 1
+}
+
+[[ "${SAC_N}" -eq 39 ]] || {
+    echo "ERROR: SAC count = ${SAC_N}"
+    exit 1
+}
+
+
+# Validate samples in VCF
+
+
+bcftools query -l "${VCF}" > "${OUT}/vcf_samples.txt"
+
+for SAMPLE in 899 1025 1042 1756 1064; do
+    grep -Fxq "${SAMPLE}" "${OUT}/vcf_samples.txt" || {
+        echo "ERROR: ${SAMPLE} not found in DRAGEN-GATK VCF"
+        exit 1
+    }
+done
+
+
+# Create population subsets
+
+
+bcftools view \
+    -S "${SAMPLE_DIR}/African_3_samples.txt" \
+    -Oz \
+    -o "${SUBSET_DIR}/dragen_gatk_African_3.vcf.gz" \
+    "${VCF}"
+
+bcftools index -t "${SUBSET_DIR}/dragen_gatk_African_3.vcf.gz"
+
+bcftools view \
+    -S "${SAMPLE_DIR}/European_2_samples.txt" \
+    -Oz \
+    -o "${SUBSET_DIR}/dragen_gatk_European_2.vcf.gz" \
+    "${VCF}"
+
+bcftools index -t "${SUBSET_DIR}/dragen_gatk_European_2.vcf.gz"
+
+bcftools view \
+    -S "${SAMPLE_DIR}/SAC_39_samples.txt" \
+    -Oz \
+    -o "${SUBSET_DIR}/dragen_gatk_SAC_39.vcf.gz" \
+    "${VCF}"
+
+bcftools index -t "${SUBSET_DIR}/dragen_gatk_SAC_39.vcf.gz"
+
+
+# Metrics function
+
+
+run_metrics() {
+
+    POP_NAME="$1"
+    POP_VCF="$2"
+    EXPECTED_SAMPLES="$3"
+
+    METRIC_DIR="${OUT}/${POP_NAME}"
+
+    mkdir -p "${METRIC_DIR}"
+
+    echo
+    echo "=========================================="
+    echo "Calculating ${POP_NAME}"
+    echo "=========================================="
+
+    # VCF validation
+    bcftools view -h "${POP_VCF}" > /dev/null
+    echo "VCF_READABLE=YES" > "${METRIC_DIR}/vcf_validation.txt"
+
+    # Basic variant counts
+    TOTAL=$(bcftools view -H "${POP_VCF}" | wc -l)
+    SNP=$(bcftools view -H -v snps "${POP_VCF}" | wc -l)
+    INDEL=$(bcftools view -H -v indels "${POP_VCF}" | wc -l)
+    MULTI=$(bcftools view -H -i 'N_ALT>1' "${POP_VCF}" | wc -l)
+    BIALLELIC=$(bcftools view -H -m2 -M2 "${POP_VCF}" | wc -l)
+
+    SNP_INDEL_RATIO=$(awk -v s="${SNP}" -v i="${INDEL}" \
+        'BEGIN {if(i>0) printf "%.6f",s/i; else print "NA"}')
+
+    MULTI_PERCENT=$(awk -v m="${MULTI}" -v t="${TOTAL}" \
+        'BEGIN {if(t>0) printf "%.6f",100*m/t; else print "NA"}')
+
+    # Ti/Tv
+    bcftools stats "${POP_VCF}" > "${METRIC_DIR}/bcftools_stats.txt"
+
+    TSTV=$(grep '^TSTV' "${METRIC_DIR}/bcftools_stats.txt" \
+        | awk '$2=="0"{print $5}')
+
+    # QUAL
+    bcftools query -f '%QUAL\n' "${POP_VCF}" \
+        > "${METRIC_DIR}/QUAL_values.txt"
+
+    awk '
+    $1!="." {
+        n++
+        sum+=$1
+        if($1<min || n==1) min=$1
+        if($1>max) max=$1
+    }
+    END {
+        if(n>0)
+            printf "N\t%d\nMean\t%.6f\nMin\t%.6f\nMax\t%.6f\n",
+                   n,sum/n,min,max
+    }' "${METRIC_DIR}/QUAL_values.txt" \
+        > "${METRIC_DIR}/QUAL_summary.txt"
+
+    # Genotypes
+    bcftools query -f '[%GT\n]' "${POP_VCF}" \
+        > "${METRIC_DIR}/genotypes.txt"
+
+    TOTAL_GT=$(wc -l < "${METRIC_DIR}/genotypes.txt")
+
+    MISSING_GT=$(awk '
+        $0=="." || $0=="./." || $0==".|." {n++}
+        END {print n+0}
+    ' "${METRIC_DIR}/genotypes.txt")
+
+    HOM_REF=$(awk '
+        $0=="0/0" || $0=="0|0" {n++}
+        END {print n+0}
+    ' "${METRIC_DIR}/genotypes.txt")
+
+    HET=$(awk '
+        $0 ~ /^[0-9]+\/[0-9]+$/ {
+            split($0,a,"/")
+            if(a[1]!=a[2]) n++
+        }
+        $0 ~ /^[0-9]+\|[0-9]+$/ {
+            split($0,a,"|")
+            if(a[1]!=a[2]) n++
+        }
+        END {print n+0}
+    ' "${METRIC_DIR}/genotypes.txt")
+
+    HOM_ALT=$(awk '
+        $0 ~ /^[1-9]+\/[1-9]+$/ {
+            split($0,a,"/")
+            if(a[1]==a[2]) n++
+        }
+        $0 ~ /^[1-9]+\|[1-9]+$/ {
+            split($0,a,"|")
+            if(a[1]==a[2]) n++
+        }
+        END {print n+0}
+    ' "${METRIC_DIR}/genotypes.txt")
+
+    OTHER=$((TOTAL_GT - MISSING_GT - HOM_REF - HET - HOM_ALT))
+
+    MISSINGNESS=$(awk -v m="${MISSING_GT}" -v t="${TOTAL_GT}" \
+        'BEGIN {if(t>0) printf "%.8f",m/t; else print "NA"}')
+
+    HET_HOMALT=$(awk -v h="${HET}" -v a="${HOM_ALT}" \
+        'BEGIN {if(a>0) printf "%.6f",h/a; else print "NA"}')
+
+    # DP
+    bcftools query -f '[%DP\n]' "${POP_VCF}" \
+        > "${METRIC_DIR}/DP_values.txt"
+
+    awk '
+    $1!="." {
+        n++
+        sum+=$1
+        if($1>=5) ge5++
+        if($1>=10) ge10++
+        if($1>=15) ge15++
+        if($1>=20) ge20++
+    }
+    END {
+        if(n>0)
+            printf "N\t%d\nMean\t%.6f\n>=5\t%d\n>=10\t%d\n>=15\t%d\n>=20\t%d\n",
+                   n,sum/n,ge5,ge10,ge15,ge20
+    }' "${METRIC_DIR}/DP_values.txt" \
+        > "${METRIC_DIR}/DP_summary.txt"
+
+    # GQ
+    bcftools query -f '[%GQ\n]' "${POP_VCF}" \
+        > "${METRIC_DIR}/GQ_values.txt"
+
+    awk '
+    $1!="." {
+        n++
+        sum+=$1
+        if($1>=10) ge10++
+        if($1>=20) ge20++
+        if($1>=30) ge30++
+        if($1>=50) ge50++
+    }
+    END {
+        if(n>0)
+            printf "N\t%d\nMean\t%.6f\n>=10\t%d\n>=20\t%d\n>=30\t%d\n>=50\t%d\n",
+                   n,sum/n,ge10,ge20,ge30,ge50
+    }' "${METRIC_DIR}/GQ_values.txt" \
+        > "${METRIC_DIR}/GQ_summary.txt"
+
+    # Per-sample genotype metrics
+    bcftools query \
+        -f '[%SAMPLE\t%GT\t%DP\t%GQ\n]' \
+        "${POP_VCF}" \
+        > "${METRIC_DIR}/per_sample_genotypes.txt"
+
+    # Main summary
+    cat > "${METRIC_DIR}/summary.tsv" <<EOF
+Metric	Value
+Population	${POP_NAME}
+Sample_count	${EXPECTED_SAMPLES}
+Total_variants	${TOTAL}
+SNPs	${SNP}
+INDELs	${INDEL}
+SNP_INDEL_ratio	${SNP_INDEL_RATIO}
+Multiallelic	${MULTI}
+Multiallelic_percent	${MULTI_PERCENT}
+Biallelic	${BIALLELIC}
+Ti_Tv	${TSTV}
+Total_genotypes	${TOTAL_GT}
+Missing_genotypes	${MISSING_GT}
+HOM_REF	${HOM_REF}
+HET	${HET}
+HOM_ALT	${HOM_ALT}
+Other_genotypes	${OTHER}
+Missingness	${MISSINGNESS}
+HET_HOM_ALT_ratio	${HET_HOMALT}
+EOF
+
+    echo "${POP_NAME} complete: $(date)"
+}
+
+
+# Run all populations
+
+
+run_metrics \
+    "African_3" \
+    "${SUBSET_DIR}/dragen_gatk_African_3.vcf.gz" \
+    3
+
+run_metrics \
+    "European_2" \
+    "${SUBSET_DIR}/dragen_gatk_European_2.vcf.gz" \
+    2
+
+run_metrics \
+    "SAC_39" \
+    "${SUBSET_DIR}/dragen_gatk_SAC_39.vcf.gz" \
+    39
+
+echo
+echo "=========================================="
+echo "DRAGEN-GATK POPULATION METRICS COMPLETE"
+echo "Completed: $(date)"
+echo "=========================================="

@@ -1,0 +1,87 @@
+#!/bin/bash
+#PBS -N HWE_AUTOSOMES
+#PBS -l nodes=1:ppn=8
+#PBS -l mem=32gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+
+module load app/plink/2.0
+
+BASE="$HOME/Variantcalling"
+OUT="$BASE/metrics/hwe_plink"
+mkdir -p "$OUT"
+
+GATK_VCF="/stor6/scratch3/27777197/gatk_cohort/filtering/gatk_hardfiltered_PASS.vcf.gz"
+DV_VCF="/stor6/scratch3/27777197/deepvariant_cohort/output/deepvariant_joint.vcf.gz"
+DRAGEN_VCF="/stor6/scratch3/27777197/dragen_gatk_cohort/filtering/dragen_gatk_hardfiltered_PASS.vcf.gz"
+
+CHR="chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22"
+
+echo "=== HWE analysis on autosomes chr1-chr22 ==="
+echo "PLINK: $(plink2 --version | head -1)"
+echo
+
+run_hwe() {
+    NAME="$1"
+    VCF="$2"
+
+    echo "=========================================="
+    echo "Processing $NAME"
+    echo "=========================================="
+
+    PREFIX="$OUT/${NAME}"
+
+    plink2 \
+        --vcf "$VCF" \
+        --chr "$CHR" \
+        --double-id \
+        --allow-extra-chr \
+        --make-pgen \
+        --out "$PREFIX"
+
+    if [ $? -ne 0 ]; then
+        echo "ERROR: PLINK conversion failed for $NAME"
+        return 1
+    fi
+
+    plink2 \
+        --pfile "$PREFIX" \
+        --hardy \
+        --out "$PREFIX"
+
+    if [ $? -ne 0 ]; then
+        echo "ERROR: PLINK HWE calculation failed for $NAME"
+        return 1
+    fi
+
+    echo "HWE calculation complete for $NAME"
+    echo
+}
+
+run_hwe "GATK" "$GATK_VCF"
+run_hwe "DeepVariant" "$DV_VCF"
+run_hwe "DRAGEN-GATK" "$DRAGEN_VCF"
+
+echo
+echo "=== HWE summary ==="
+
+SUMMARY="$OUT/HWE_summary.tsv"
+
+printf "Pipeline\tVariants_tested\tHWE_P_lt_1e-6\n" > "$SUMMARY"
+
+for NAME in GATK DeepVariant DRAGEN-GATK
+do
+    HARDY="$OUT/${NAME}.hardy"
+
+    if [ -f "$HARDY" ]; then
+        TOTAL=$(tail -n +2 "$HARDY" | wc -l)
+        PVAL=$(awk 'NR>1 && $NF < 1e-6 {n++} END {print n+0}' "$HARDY")
+
+        printf "%s\t%s\t%s\n" "$NAME" "$TOTAL" "$PVAL" >> "$SUMMARY"
+    else
+        printf "%s\tNA\tNA\n" "$NAME" >> "$SUMMARY"
+    fi
+done
+
+echo
+cat "$SUMMARY"

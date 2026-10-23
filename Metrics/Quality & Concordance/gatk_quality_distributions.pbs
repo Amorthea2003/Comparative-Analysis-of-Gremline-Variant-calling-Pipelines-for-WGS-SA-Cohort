@@ -1,0 +1,175 @@
+#!/bin/bash
+#PBS -N GATK_QUALITY
+#PBS -l select=1:ncpus=8:mem=16gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -o /home/27777197/Variantcalling/metrics/gatk_quality_distributions.log
+
+set -euo pipefail
+
+module load app/bcftools/1.19
+
+VCF="/stor6/scratch3/27777197/gatk_cohort/filtering/gatk_hardfiltered_PASS.vcf.gz"
+
+OUT="/home/27777197/Variantcalling/metrics/gatk_quality"
+mkdir -p "$OUT"
+
+echo "============================================================"
+echo "GATK QUALITY DISTRIBUTIONS"
+echo "Started: $(date)"
+echo "============================================================"
+
+
+# QUAL
+
+
+echo "Calculating QUAL metrics..."
+
+bcftools query -f '%QUAL\n' "$VCF" \
+| awk '
+BEGIN {
+    n=0
+    sum=0
+    q10=0
+    q20=0
+    q30=0
+    q50=0
+    q100=0
+}
+$1 != "." {
+    n++
+    sum += $1
+
+    if ($1 >= 10)  q10++
+    if ($1 >= 20)  q20++
+    if ($1 >= 30)  q30++
+    if ($1 >= 50)  q50++
+    if ($1 >= 100) q100++
+}
+END {
+    printf "QUAL_N\t%d\n", n
+    printf "QUAL_mean\t%.6f\n", sum/n
+    printf "QUAL_ge_10\t%d\n", q10
+    printf "QUAL_ge_20\t%d\n", q20
+    printf "QUAL_ge_30\t%d\n", q30
+    printf "QUAL_ge_50\t%d\n", q50
+    printf "QUAL_ge_100\t%d\n", q100
+}
+' > "$OUT/qual_metrics.tsv"
+
+
+# FORMAT/DP
+
+
+echo "Calculating DP metrics..."
+
+bcftools query -f '[%DP\n]' "$VCF" \
+| awk '
+BEGIN {
+    n=0
+    sum=0
+    dp5=0
+    dp10=0
+    dp15=0
+    dp20=0
+}
+$1 != "." {
+    n++
+    sum += $1
+
+    if ($1 >= 5)  dp5++
+    if ($1 >= 10) dp10++
+    if ($1 >= 15) dp15++
+    if ($1 >= 20) dp20++
+}
+END {
+    printf "DP_N\t%d\n", n
+    printf "DP_mean\t%.6f\n", sum/n
+    printf "DP_ge_5\t%d\n", dp5
+    printf "DP_ge_10\t%d\n", dp10
+    printf "DP_ge_15\t%d\n", dp15
+    printf "DP_ge_20\t%d\n", dp20
+}
+' > "$OUT/dp_metrics.tsv"
+
+
+# FORMAT/GQ
+
+
+echo "Calculating GQ metrics..."
+
+bcftools query -f '[%GQ\n]' "$VCF" \
+| awk '
+BEGIN {
+    n=0
+    sum=0
+    gq10=0
+    gq20=0
+    gq30=0
+    gq50=0
+}
+$1 != "." {
+    n++
+    sum += $1
+
+    if ($1 >= 10) gq10++
+    if ($1 >= 20) gq20++
+    if ($1 >= 30) gq30++
+    if ($1 >= 50) gq50++
+}
+END {
+    printf "GQ_N\t%d\n", n
+    printf "GQ_mean\t%.6f\n", sum/n
+    printf "GQ_ge_10\t%d\n", gq10
+    printf "GQ_ge_20\t%d\n", gq20
+    printf "GQ_ge_30\t%d\n", gq30
+    printf "GQ_ge_50\t%d\n", gq50
+}
+' > "$OUT/gq_metrics.tsv"
+
+
+# Combined Excel-ready table
+
+
+{
+    echo -e "Metric\tGATK"
+
+    awk -F'\t' '
+    $1=="QUAL_N"    {print "QUAL N\t"$2}
+    $1=="QUAL_mean" {print "QUAL mean\t"$2}
+    $1=="QUAL_ge_10" {print "QUAL >= 10\t"$2}
+    $1=="QUAL_ge_20" {print "QUAL >= 20\t"$2}
+    $1=="QUAL_ge_30" {print "QUAL >= 30\t"$2}
+    $1=="QUAL_ge_50" {print "QUAL >= 50\t"$2}
+    $1=="QUAL_ge_100" {print "QUAL >= 100\t"$2}
+    ' "$OUT/qual_metrics.tsv"
+
+    awk -F'\t' '
+    $1=="DP_N" {print "DP N\t"$2}
+    $1=="DP_mean" {print "DP mean\t"$2}
+    $1=="DP_ge_5" {print "DP >= 5\t"$2}
+    $1=="DP_ge_10" {print "DP >= 10\t"$2}
+    $1=="DP_ge_15" {print "DP >= 15\t"$2}
+    $1=="DP_ge_20" {print "DP >= 20\t"$2}
+    ' "$OUT/dp_metrics.tsv"
+
+    awk -F'\t' '
+    $1=="GQ_N" {print "GQ N\t"$2}
+    $1=="GQ_mean" {print "GQ mean\t"$2}
+    $1=="GQ_ge_10" {print "GQ >= 10\t"$2}
+    $1=="GQ_ge_20" {print "GQ >= 20\t"$2}
+    $1=="GQ_ge_30" {print "GQ >= 30\t"$2}
+    $1=="GQ_ge_50" {print "GQ >= 50\t"$2}
+    ' "$OUT/gq_metrics.tsv"
+
+} > "$OUT/GATK_quality_summary.tsv"
+
+echo
+echo "============================================================"
+echo "GATK QUALITY RESULTS"
+echo "============================================================"
+
+cat "$OUT/GATK_quality_summary.tsv"
+
+echo
+echo "Completed: $(date)"

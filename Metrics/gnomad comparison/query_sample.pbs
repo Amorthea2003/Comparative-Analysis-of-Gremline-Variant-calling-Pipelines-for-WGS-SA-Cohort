@@ -1,0 +1,46 @@
+#!/bin/bash
+#PBS -N GNOMAD_SAMPLE
+#PBS -l select=1:ncpus=2:mem=8gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+
+set -euo pipefail
+module load app/bcftools/1.19
+
+OUT=/stor6/scratch3/27777197/gnomad_compare
+TEST="$OUT/gnomad_sample_test"
+GNOMAD_BASE="https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/vcf/genomes"
+
+: > "$TEST/gnomad_sample.tsv"
+: > "$TEST/unsupported_contigs.tsv"
+
+while IFS=$'\t' read -r chrom pos; do
+    case "$chrom" in
+        chr[1-9]|chr[1-9][0-9]|chrX|chrY|chrM)
+            url="$GNOMAD_BASE/gnomad.genomes.v4.1.sites.${chrom}.vcf.bgz"
+            printf '%s\t%s\n' "$chrom" "$pos" >> "$TEST/query_regions.tsv"
+            ;;
+        *)
+            printf '%s\t%s\n' "$chrom" "$pos" >> "$TEST/unsupported_contigs.tsv"
+            ;;
+    esac
+done < "$TEST/sample.positions.tsv"
+
+for chrom in $(cut -f1 "$TEST/query_regions.tsv" | sort -u); do
+    echo "[$(date)] Querying $chrom"
+    awk -F'\t' -v c="$chrom" '$1==c {print $1,$2}' OFS='\t' \
+        "$TEST/query_regions.tsv" > "$TEST/regions_${chrom}.tsv"
+
+    url="$GNOMAD_BASE/gnomad.genomes.v4.1.sites.${chrom}.vcf.bgz"
+
+    bcftools view -R "$TEST/regions_${chrom}.tsv" "$url" -Ou \
+      | bcftools norm -f "$HOME/Variantcalling/reference/hg38.fa" -m -any -Ou \
+      | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%FILTER\t%AF_afr\t%AN_afr\n' \
+      >> "$TEST/gnomad_sample.tsv"
+done
+
+sort -u "$TEST/gnomad_sample.tsv" -o "$TEST/gnomad_sample.tsv"
+
+echo "[$(date)] Query complete"
+echo "Returned gnomAD records: $(wc -l < "$TEST/gnomad_sample.tsv")"
+echo "Unsupported contig positions: $(wc -l < "$TEST/unsupported_contigs.tsv")"

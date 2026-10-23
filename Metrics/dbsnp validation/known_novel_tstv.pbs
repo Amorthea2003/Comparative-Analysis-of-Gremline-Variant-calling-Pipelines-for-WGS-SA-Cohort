@@ -1,0 +1,264 @@
+#!/bin/bash
+#PBS -N KNOWN_NOVEL_TSTV
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/bcftools/1.19
+
+BASE="/stor6/scratch3/27777197"
+REF="${HOME}/Variantcalling/reference/hg38.fa"
+DBSNP="${HOME}/Variantcalling/reference/bqsr/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+
+OUT="${HOME}/Variantcalling/metrics/known_novel_tstv"
+mkdir -p "${OUT}"
+
+GATK="${BASE}/gatk_cohort/filtering/gatk_hardfiltered_PASS.vcf.gz"
+DV="${BASE}/deepvariant_cohort/output/deepvariant_joint.vcf.gz"
+DRAGEN="${BASE}/dragen_gatk_cohort/filtering/dragen_gatk_hardfiltered_PASS.vcf.gz"
+
+PRIMARY="chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX,chrY"
+
+echo "========================================"
+echo "Known / Novel Ti/Tv Analysis"
+echo "Started: $(date)"
+echo "========================================"
+
+
+# Function to process one pipeline
+
+
+process_pipeline() {
+
+    NAME="$1"
+    INPUT="$2"
+
+    DIR="${OUT}/${NAME}"
+    mkdir -p "${DIR}"
+
+    echo
+    echo "========================================"
+    echo "Processing ${NAME}"
+    echo "========================================"
+
+    # Step 1: Restrict to primary chromosomes
+    echo "Step 1: Restricting to primary chromosomes..."
+
+    bcftools view \
+        -r "${PRIMARY}" \
+        -Oz \
+        -o "${DIR}/${NAME}_primary.vcf.gz" \
+        "${INPUT}"
+
+    bcftools index -t "${DIR}/${NAME}_primary.vcf.gz"
+
+    # Step 2: Normalize and split multiallelic variants
+    echo "Step 2: Normalizing and splitting variants..."
+
+    bcftools norm \
+        -f "${REF}" \
+        -m -any \
+        -Oz \
+        -o "${DIR}/${NAME}_normalized.vcf.gz" \
+        "${DIR}/${NAME}_primary.vcf.gz"
+
+    bcftools index -t "${DIR}/${NAME}_normalized.vcf.gz"
+
+    # Step 3: Keep SNPs only
+    echo "Step 3: Extracting SNPs..."
+
+    bcftools view \
+        -v snps \
+        -Oz \
+        -o "${DIR}/${NAME}_snps.vcf.gz" \
+        "${DIR}/${NAME}_normalized.vcf.gz"
+
+    bcftools index -t "${DIR}/${NAME}_snps.vcf.gz"
+
+    # Step 4: Annotate against dbSNP138
+    echo "Step 4: Annotating against dbSNP138..."
+
+    bcftools annotate \
+        -a "${DBSNP}" \
+        -c ID \
+        -Oz \
+        -o "${DIR}/${NAME}_snps_dbsnp.vcf.gz" \
+        "${DIR}/${NAME}_snps.vcf.gz"
+
+    bcftools index -t "${DIR}/${NAME}_snps_dbsnp.vcf.gz"
+
+    
+    # Known / novel counts
+    
+
+    echo "Step 5: Calculating known / novel counts..."
+
+    KNOWN_COUNT=$(bcftools view -H "${DIR}/${NAME}_snps_dbsnp.vcf.gz" \
+        | awk '$3 != "." && $3 != "" {n++} END {print n+0}')
+
+    NOVEL_COUNT=$(bcftools view -H "${DIR}/${NAME}_snps_dbsnp.vcf.gz" \
+        | awk '$3 == "." || $3 == "" {n++} END {print n+0}')
+
+    TOTAL_SNP=$(bcftools view -H "${DIR}/${NAME}_snps_dbsnp.vcf.gz" \
+        | wc -l)
+
+    
+    # Transition / transversion counts
+    
+
+    KNOWN_TI=$(bcftools view -H "${DIR}/${NAME}_snps_dbsnp.vcf.gz" \
+        | awk '
+        $3 != "." && $3 != "" {
+            ref=$4
+            alt=$5
+            if ((ref=="A" && alt=="G") ||
+                (ref=="G" && alt=="A") ||
+                (ref=="C" && alt=="T") ||
+                (ref=="T" && alt=="C"))
+                ti++
+        }
+        END {print ti+0}')
+
+    KNOWN_TV=$(bcftools view -H "${DIR}/${NAME}_snps_dbsnp.vcf.gz" \
+        | awk '
+        $3 != "." && $3 != "" {
+            ref=$4
+            alt=$5
+            if (!((ref=="A" && alt=="G") ||
+                  (ref=="G" && alt=="A") ||
+                  (ref=="C" && alt=="T") ||
+                  (ref=="T" && alt=="C")))
+                tv++
+        }
+        END {print tv+0}')
+
+    NOVEL_TI=$(bcftools view -H "${DIR}/${NAME}_snps_dbsnp.vcf.gz" \
+        | awk '
+        $3 == "." || $3 == "" {
+            ref=$4
+            alt=$5
+            if ((ref=="A" && alt=="G") ||
+                (ref=="G" && alt=="A") ||
+                (ref=="C" && alt=="T") ||
+                (ref=="T" && alt=="C"))
+                ti++
+        }
+        END {print ti+0}')
+
+    NOVEL_TV=$(bcftools view -H "${DIR}/${NAME}_snps_dbsnp.vcf.gz" \
+        | awk '
+        $3 == "." || $3 == "" {
+            ref=$4
+            alt=$5
+            if (!((ref=="A" && alt=="G") ||
+                  (ref=="G" && alt=="A") ||
+                  (ref=="C" && alt=="T") ||
+                  (ref=="T" && alt=="C")))
+                tv++
+        }
+        END {print tv+0}')
+
+    # --------------------------------------------------------
+    # Ratios
+    # --------------------------------------------------------
+
+    KNOWN_TSTV=$(awk -v ti="${KNOWN_TI}" -v tv="${KNOWN_TV}" \
+        'BEGIN {if (tv>0) printf "%.6f", ti/tv; else print "NA"}')
+
+    NOVEL_TSTV=$(awk -v ti="${NOVEL_TI}" -v tv="${NOVEL_TV}" \
+        'BEGIN {if (tv>0) printf "%.6f", ti/tv; else print "NA"}')
+
+    # --------------------------------------------------------
+    # Write summary
+    # --------------------------------------------------------
+
+    cat > "${DIR}/summary.tsv" <<SUMMARY
+Pipeline${NAME}
+Total_SNPs${TOTAL_SNP}
+Known_SNPs${KNOWN_COUNT}
+Novel_SNPs${NOVEL_COUNT}
+Known_Transitions${KNOWN_TI}
+Known_Transversions${KNOWN_TV}
+Known_Ti_Tv${KNOWN_TSTV}
+Novel_Transitions${NOVEL_TI}
+Novel_Transversions${NOVEL_TV}
+Novel_Ti_Tv${NOVEL_TSTV}
+SUMMARY
+
+    echo
+    echo "${NAME} results:"
+    cat "${DIR}/summary.tsv"
+
+    # --------------------------------------------------------
+    # Sanity check
+    # --------------------------------------------------------
+
+    CHECK=$((KNOWN_COUNT + NOVEL_COUNT))
+
+    if [ "${CHECK}" -ne "${TOTAL_SNP}" ]; then
+        echo "ERROR: Known + novel does not equal total SNPs for ${NAME}"
+        echo "Known=${KNOWN_COUNT}"
+        echo "Novel=${NOVEL_COUNT}"
+        echo "Total=${TOTAL_SNP}"
+        exit 1
+    fi
+
+    echo "Sanity check PASSED for ${NAME}"
+}
+
+# ------------------------------------------------------------
+# Run all three pipelines
+# ------------------------------------------------------------
+
+process_pipeline "GATK" "${GATK}"
+process_pipeline "DeepVariant" "${DV}"
+process_pipeline "DRAGEN-GATK" "${DRAGEN}"
+
+# ------------------------------------------------------------
+# Combined summary
+# ------------------------------------------------------------
+
+echo
+echo "========================================"
+echo "Creating combined summary"
+echo "========================================"
+
+{
+    echo -e "Pipeline\tTotal_SNPs\tKnown_SNPs\tNovel_SNPs\tKnown_Transitions\tKnown_Transversions\tKnown_Ti_Tv\tNovel_Transitions\tNovel_Transversions\tNovel_Ti_Tv"
+
+    for P in GATK DeepVariant DRAGEN-GATK
+    do
+        awk -F'\t' '
+        NR==1 {next}
+        {
+            a[$1]=$2
+        }
+        END {
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+            "'"${P}"'",
+            a["Total_SNPs"],
+            a["Known_SNPs"],
+            a["Novel_SNPs"],
+            a["Known_Transitions"],
+            a["Known_Transversions"],
+            a["Known_Ti_Tv"],
+            a["Novel_Transitions"],
+            a["Novel_Transversions"],
+            a["Novel_Ti_Tv"]
+        }' "${OUT}/${P}/summary.tsv"
+    done
+
+} > "${OUT}/known_novel_tstv_summary.tsv"
+
+echo
+cat "${OUT}/known_novel_tstv_summary.tsv"
+
+echo
+echo "========================================"
+echo "Analysis completed: $(date)"
+echo "Output:"
+echo "${OUT}/known_novel_tstv_summary.tsv"
+echo "========================================"
