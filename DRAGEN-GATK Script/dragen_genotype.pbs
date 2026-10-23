@@ -1,0 +1,87 @@
+#!/bin/bash
+#PBS -N DRAGEN_GENO
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/gatk/4.6.2.0
+
+REFERENCE="${HOME}/Variantcalling/reference/hg38.fa"
+COHORT_DIR="/stor6/scratch3/27777197/dragen_gatk_cohort"
+INTERVAL_DIR="${COHORT_DIR}/intervals"
+OUTPUT_DIR="${COHORT_DIR}/genotyped"
+BATCH="${BATCH:?BATCH environment variable is required}"
+
+GENOMICSDB="${COHORT_DIR}/genomicsdb_batch_${BATCH}"
+INTERVALS="${INTERVAL_DIR}/batch_${BATCH}.intervals"
+OUTPUT="${OUTPUT_DIR}/dragen_gatk_batch_${BATCH}.vcf.gz"
+DONE="${OUTPUT_DIR}/GenotypeGVCFs_batch_${BATCH}.done"
+
+if [[ -z "${TMPDIR:-}" ]]; then
+    echo "ERROR: PBS did not provide TMPDIR."
+    exit 1
+fi
+
+TMP_DIR="${TMPDIR}/genotype_${BATCH}"
+mkdir -p "${TMP_DIR}" "${OUTPUT_DIR}"
+
+echo "=========================================="
+echo "GenotypeGVCFs batch ${BATCH}"
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+echo "GenomicsDB: ${GENOMICSDB}"
+echo "Intervals: ${INTERVALS}"
+echo "Output: ${OUTPUT}"
+echo "TMPDIR: ${TMPDIR}"
+echo "=========================================="
+
+df -h "${TMPDIR}"
+
+test -s "${REFERENCE}"
+test -s "${REFERENCE}.fai"
+test -s "${REFERENCE%.*}.dict"
+test -s "${INTERVALS}"
+test -d "${GENOMICSDB}"
+
+if [[ -e "${DONE}" ]]; then
+    echo "DONE marker already exists: ${DONE}"
+    exit 0
+fi
+
+if [[ -e "${OUTPUT}" ]]; then
+    echo "ERROR: Output already exists:"
+    echo "${OUTPUT}"
+    exit 1
+fi
+
+echo
+echo "Starting GenotypeGVCFs..."
+
+gatk --java-options "-Xmx28g" GenotypeGVCFs \
+    -R "${REFERENCE}" \
+    -V "gendb://${GENOMICSDB}" \
+    -L "${INTERVALS}" \
+    -O "${OUTPUT}" \
+    --tmp-dir "${TMP_DIR}"
+
+echo
+echo "GenotypeGVCFs completed successfully."
+
+test -s "${OUTPUT}"
+
+echo "Creating index..."
+gatk IndexFeatureFile \
+    -I "${OUTPUT}"
+
+test -s "${OUTPUT}.tbi" || test -s "${OUTPUT}.csi"
+
+touch "${DONE}"
+
+echo "=========================================="
+echo "SUCCESS"
+echo "Output: ${OUTPUT}"
+echo "Done: $(date)"
+echo "=========================================="

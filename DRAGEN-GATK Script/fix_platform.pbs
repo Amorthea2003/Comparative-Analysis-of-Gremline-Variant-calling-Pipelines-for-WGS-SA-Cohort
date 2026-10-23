@@ -1,0 +1,199 @@
+#!/bin/bash
+#PBS -N DRAGEN_FixRG
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -j oe
+
+set -Eeuo pipefail
+
+module purge
+module load app/gatk/4.6.2.0
+module load app/samtools/1.20
+
+BASE_DIR="$HOME/Variantcalling/dragen_gatk"
+SAMPLE="${SAMPLE:?ERROR: SAMPLE not supplied}"
+
+SAMPLE_DIR="${BASE_DIR}/${SAMPLE}"
+
+BAM="${SAMPLE_DIR}/markduplicates/${SAMPLE}_dedup.bam"
+NEW_BAM="${SAMPLE_DIR}/fixrg/${SAMPLE}_dedup_fixed.bam"
+NEW_BAI="${NEW_BAM}.bai"
+HEADER="${SAMPLE_DIR}/fixrg/${SAMPLE}_fixed_header.sam"
+LOG="${SAMPLE_DIR}/dragen_fixRG.log"
+
+mkdir -p "${SAMPLE_DIR}/fixrg"
+
+exec > >(tee -a "${LOG}") 2>&1
+
+echo "============================================================"
+echo "DRAGEN-GATK FIX READ GROUP"
+echo "Sample: ${SAMPLE}"
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+echo "Job ID: ${PBS_JOBID:-unknown}"
+echo "============================================================"
+
+
+# CHECK INPUT
+
+
+if [[ ! -s "${BAM}" ]]; then
+    echo "ERROR: Deduplicated BAM not found:"
+    echo "${BAM}"
+    exit 1
+fi
+
+echo
+echo "Input BAM:"
+ls -lh "${BAM}"
+
+echo
+echo "Original read group:"
+samtools view -H "${BAM}" | grep '^@RG' || true
+
+
+# CREATE CORRECTED HEADER
+
+
+echo
+echo "Creating corrected header..."
+
+samtools view -H "${BAM}" \
+    | awk -v rgid="${SAMPLE}" -v rgsm="${SAMPLE}" '
+        BEGIN {
+            rg_added = 0
+        }
+
+        /^@RG/ {
+            if (!rg_added) {
+                print "@RG\tID:" rgid "\tSM:" rgsm "\tPL:DNBSEQ\tPM:MGI"
+                rg_added = 1
+            }
+            next
+        }
+
+        {
+            print
+        }
+
+        END {
+            if (!rg_added) {
+                print "@RG\tID:" rgid "\tSM:" rgsm "\tPL:DNBSEQ\tPM:MGI"
+            }
+        }
+    ' > "${HEADER}"
+
+echo
+echo "Corrected read group:"
+grep '^@RG' "${HEADER}"
+
+
+# VERIFY HEADER
+
+
+if ! grep -q $'^@RG\tID:' "${HEADER}"; then
+    echo "ERROR: Corrected header has no @RG line."
+    exit 1
+fi
+
+if ! grep -q $'\tSM:' "${HEADER}"; then
+    echo "ERROR: Corrected header has no SM field."
+    exit 1
+fi
+
+if ! grep -q $'\tPL:DNBSEQ\t' "${HEADER}"; then
+    echo "ERROR: Corrected header does not contain PL:DNBSEQ."
+    exit 1
+fi
+
+if ! grep -q $'\tPM:MGI' "${HEADER}"; then
+    echo "ERROR: Corrected header does not contain PM:MGI."
+    exit 1
+fi
+
+
+# CREATE CORRECTED BAM
+
+
+echo
+echo "Creating corrected BAM..."
+
+rm -f "${NEW_BAM}" "${NEW_BAI}"
+
+samtools reheader \
+    "${HEADER}" \
+    "${BAM}" \
+    > "${NEW_BAM}"
+
+rm -f "${HEADER}"
+
+if [[ ! -s "${NEW_BAM}" ]]; then
+    echo "ERROR: Corrected BAM was not created."
+    exit 1
+fi
+
+
+# INDEX
+
+
+echo
+echo "Indexing corrected BAM..."
+
+samtools index \
+    -@ 4 \
+    "${NEW_BAM}"
+
+if [[ ! -s "${NEW_BAI}" ]]; then
+    echo "ERROR: Corrected BAM index was not created."
+    exit 1
+fi
+
+
+# FINAL VALIDATION
+
+
+echo
+echo "Corrected read group in BAM:"
+samtools view -H "${NEW_BAM}" | grep '^@RG'
+
+echo
+echo "Checking BAM:"
+samtools quickcheck "${NEW_BAM}"
+
+echo
+echo "Checking BAM index:"
+samtools idxstats "${NEW_BAM}" > /dev/null
+
+echo
+echo "Checking files:"
+ls -lh "${NEW_BAM}" "${NEW_BAI}"
+
+
+# VERIFY FINAL READ GROUP
+
+
+FINAL_RG="$(samtools view -H "${NEW_BAM}" | grep '^@RG' || true)"
+
+if [[ "${FINAL_RG}" != *"PL:DNBSEQ"* ]]; then
+    echo "ERROR: Final BAM does not contain PL:DNBSEQ."
+    exit 1
+fi
+
+if [[ "${FINAL_RG}" != *"PM:MGI"* ]]; then
+    echo "ERROR: Final BAM does not contain PM:MGI."
+    exit 1
+fi
+
+if [[ "${FINAL_RG}" != *"SM:${SAMPLE}"* ]]; then
+    echo "ERROR: Final BAM does not contain SM:${SAMPLE}."
+    exit 1
+fi
+
+echo
+echo "============================================================"
+echo "DRAGEN-GATK FIXRG COMPLETED SUCCESSFULLY"
+echo "Sample: ${SAMPLE}"
+echo "Input:  ${BAM}"
+echo "Output: ${NEW_BAM}"
+echo "Finished: $(date)"
+echo "============================================================"

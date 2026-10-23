@@ -1,0 +1,90 @@
+#!/bin/bash
+#PBS -N GDB_BATCH
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/gatk/4.6.2.0
+
+REFERENCE="${HOME}/Variantcalling/reference/hg38.fa"
+INTERVAL_DIR="/stor6/scratch3/27777197/dragen_gatk_cohort/intervals"
+COHORT_DIR="/stor6/scratch3/27777197/dragen_gatk_cohort"
+SAMPLE_MAP="${COHORT_DIR}/sample_map.txt"
+
+BATCH="${BATCH:?BATCH environment variable is required}"
+
+INTERVALS="${INTERVAL_DIR}/batch_${BATCH}.intervals"
+GENOMICSDB="${COHORT_DIR}/genomicsdb_batch_${BATCH}"
+DONE="${COHORT_DIR}/GenomicsDBImport_batch_${BATCH}.done"
+
+# Use node-local temporary storage for GenomicsDB native libraries.
+if [[ -z "${TMPDIR:-}" ]]; then
+    echo "ERROR: PBS did not provide TMPDIR."
+    exit 1
+fi
+
+TMP_DIR="${TMPDIR}/genomicsdb_batch_${BATCH}"
+mkdir -p "${TMP_DIR}"
+
+echo "=========================================="
+echo "GenomicsDBImport batch ${BATCH}"
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+echo "Intervals: ${INTERVALS}"
+echo "Workspace: ${GENOMICSDB}"
+echo "TMPDIR: ${TMPDIR}"
+echo "GenomicsDB TMP: ${TMP_DIR}"
+echo "=========================================="
+
+echo
+echo "Temporary filesystem:"
+df -h "${TMPDIR}"
+
+# Basic validation
+test -s "${REFERENCE}"
+test -s "${REFERENCE}.fai"
+test -s "${REFERENCE%.*}.dict"
+test -s "${SAMPLE_MAP}"
+test -s "${INTERVALS}"
+
+if [[ -e "${DONE}" ]]; then
+    echo "DONE marker already exists: ${DONE}"
+    echo "Nothing to do."
+    exit 0
+fi
+
+if [[ -e "${GENOMICSDB}" ]]; then
+    echo "ERROR: GenomicsDB workspace already exists:"
+    echo "${GENOMICSDB}"
+    echo "Refusing to overwrite it."
+    exit 1
+fi
+
+echo
+echo "Interval count:"
+wc -l "${INTERVALS}"
+
+echo
+echo "Sample-map count:"
+wc -l "${SAMPLE_MAP}"
+
+echo
+echo "Starting GenomicsDBImport..."
+
+gatk --java-options "-Xmx56g" GenomicsDBImport \
+    --genomicsdb-workspace-path "${GENOMICSDB}" \
+    --sample-name-map "${SAMPLE_MAP}" \
+    -L "${INTERVALS}" \
+    --tmp-dir "${TMP_DIR}" \
+    --batch-size 4
+
+echo
+echo "GenomicsDBImport completed successfully."
+
+touch "${DONE}"
+
+echo "Done: $(date)"
+echo "DONE marker: ${DONE}"

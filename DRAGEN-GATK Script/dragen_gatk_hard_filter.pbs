@@ -1,0 +1,308 @@
+#!/bin/bash
+#PBS -N DRAGEN_GATK_HARD_FILTER
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/gatk/4.6.2.0
+module load app/bcftools/1.19
+
+
+# INPUT / OUTPUT
+
+
+INPUT="/stor6/scratch3/27777197/dragen_gatk_cohort/output/joint.vcf.gz"
+
+OUTDIR="/stor6/scratch3/27777197/dragen_gatk_cohort/filtering"
+
+SNP_RAW="${OUTDIR}/dragen_gatk_snps.vcf.gz"
+INDEL_RAW="${OUTDIR}/dragen_gatk_indels.vcf.gz"
+
+SNP_FILTERED="${OUTDIR}/dragen_gatk_snps_hardfiltered.vcf.gz"
+INDEL_FILTERED="${OUTDIR}/dragen_gatk_indels_hardfiltered.vcf.gz"
+
+SNP_PASS="${OUTDIR}/dragen_gatk_snps_PASS.vcf.gz"
+INDEL_PASS="${OUTDIR}/dragen_gatk_indels_PASS.vcf.gz"
+
+FINAL="${OUTDIR}/dragen_gatk_hardfiltered_PASS.vcf.gz"
+
+DONE="${OUTDIR}/DRAGEN_GATK_HARD_FILTER.done"
+
+REFERENCE="${HOME}/Variantcalling/reference/hg38.fa"
+
+
+# START
+
+
+echo "=========================================="
+echo "DRAGEN-GATK HARD FILTERING"
+echo "=========================================="
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+echo "Input: ${INPUT}"
+echo "Output directory: ${OUTDIR}"
+echo "=========================================="
+
+
+# STEP 0: Validate input files
+
+
+echo
+echo "=========================================="
+echo "STEP 0: VALIDATE INPUT"
+echo "=========================================="
+
+test -s "${INPUT}"
+test -s "${REFERENCE}"
+test -s "${REFERENCE}.fai"
+test -s "${HOME}/Variantcalling/reference/hg38.dict"
+
+if [[ -e "${INPUT}.tbi" ]]; then
+    echo "Input index: TBI"
+elif [[ -e "${INPUT}.csi" ]]; then
+    echo "Input index: CSI"
+else
+    echo "ERROR: Input VCF index not found."
+    exit 1
+fi
+
+mkdir -p "${OUTDIR}"
+
+if [[ -e "${DONE}" ]]; then
+    echo "DONE marker already exists."
+    echo "Filtering already completed."
+    exit 0
+fi
+
+echo
+echo "Sample count:"
+bcftools query -l "${INPUT}" | wc -l
+
+echo
+echo "Input variant count:"
+bcftools index -n "${INPUT}"
+
+echo
+echo "Checking required annotations..."
+
+for annotation in QD FS SOR MQ MQRankSum ReadPosRankSum; do
+
+    if bcftools view -h "${INPUT}" | \
+        grep -q "^##INFO=<ID=${annotation},"; then
+
+        echo "OK: ${annotation}"
+
+    else
+
+        echo "ERROR: Required annotation ${annotation} is missing."
+        exit 1
+
+    fi
+
+done
+
+
+# STEP 1: Separate SNPs and INDELs
+
+
+echo
+echo "=========================================="
+echo "STEP 1: SEPARATE SNPs AND INDELs"
+echo "=========================================="
+
+echo "Selecting SNPs..."
+
+gatk SelectVariants \
+    -R "${REFERENCE}" \
+    -V "${INPUT}" \
+    --select-type-to-include SNP \
+    -O "${SNP_RAW}"
+
+echo "Selecting INDELs..."
+
+gatk SelectVariants \
+    -R "${REFERENCE}" \
+    -V "${INPUT}" \
+    --select-type-to-include INDEL \
+    -O "${INDEL_RAW}"
+
+echo
+echo "SNP count:"
+bcftools index -n "${SNP_RAW}"
+
+echo
+echo "INDEL count:"
+bcftools index -n "${INDEL_RAW}"
+
+
+# STEP 2: HARD-FILTER SNPs
+
+
+echo
+echo "=========================================="
+echo "STEP 2: HARD-FILTER SNPs"
+echo "=========================================="
+
+gatk VariantFiltration \
+    -R "${REFERENCE}" \
+    -V "${SNP_RAW}" \
+    --filter-name "QD_lt_2" \
+    --filter-expression "QD < 2.0" \
+    --filter-name "FS_gt_60" \
+    --filter-expression "FS > 60.0" \
+    --filter-name "SOR_gt_3" \
+    --filter-expression "SOR > 3.0" \
+    --filter-name "MQ_lt_40" \
+    --filter-expression "MQ < 40.0" \
+    --filter-name "MQRankSum_lt_-12.5" \
+    --filter-expression "MQRankSum < -12.5" \
+    --filter-name "ReadPosRankSum_lt_-8" \
+    --filter-expression "ReadPosRankSum < -8.0" \
+    -O "${SNP_FILTERED}"
+
+
+# STEP 3: HARD-FILTER INDELs
+
+
+echo
+echo "=========================================="
+echo "STEP 3: HARD-FILTER INDELs"
+echo "=========================================="
+
+gatk VariantFiltration \
+    -R "${REFERENCE}" \
+    -V "${INDEL_RAW}" \
+    --filter-name "QD_lt_2" \
+    --filter-expression "QD < 2.0" \
+    --filter-name "FS_gt_200" \
+    --filter-expression "FS > 200.0" \
+    --filter-name "SOR_gt_10" \
+    --filter-expression "SOR > 10.0" \
+    --filter-name "ReadPosRankSum_lt_-20" \
+    --filter-expression "ReadPosRankSum < -20.0" \
+    -O "${INDEL_FILTERED}"
+
+
+# STEP 4: KEEP PASS VARIANTS
+
+
+echo
+echo "=========================================="
+echo "STEP 4: KEEP PASS VARIANTS"
+echo "=========================================="
+
+bcftools view \
+    -f PASS \
+    -Oz \
+    -o "${SNP_PASS}" \
+    "${SNP_FILTERED}"
+
+bcftools view \
+    -f PASS \
+    -Oz \
+    -o "${INDEL_PASS}" \
+    "${INDEL_FILTERED}"
+
+bcftools index -t "${SNP_PASS}"
+bcftools index -t "${INDEL_PASS}"
+
+echo
+echo "PASS SNP count:"
+bcftools index -n "${SNP_PASS}"
+
+echo
+echo "PASS INDEL count:"
+bcftools index -n "${INDEL_PASS}"
+
+
+# STEP 5: COMBINE PASS SNPs + INDELs
+
+
+echo
+echo "=========================================="
+echo "STEP 5: COMBINE PASS SNPs + INDELs"
+echo "=========================================="
+
+bcftools concat \
+    -a \
+    -Oz \
+    -o "${FINAL}" \
+    "${SNP_PASS}" \
+    "${INDEL_PASS}"
+
+bcftools index -t "${FINAL}"
+
+
+# STEP 6: VALIDATE FINAL VCF
+
+
+echo
+echo "=========================================="
+echo "STEP 6: VALIDATE FINAL VCF"
+echo "=========================================="
+
+echo
+echo "Final PASS variant count:"
+bcftools index -n "${FINAL}"
+
+echo
+echo "Final VCF:"
+ls -lh "${FINAL}" "${FINAL}.tbi"
+
+echo
+echo "Checking VCF readability..."
+
+bcftools view -h "${FINAL}" >/dev/null
+
+echo
+echo "Checking sample count..."
+
+FINAL_SAMPLES=$(bcftools query -l "${FINAL}" | wc -l)
+
+echo "Final sample count: ${FINAL_SAMPLES}"
+
+if [[ "${FINAL_SAMPLES}" -ne 44 ]]; then
+    echo "ERROR: Expected 44 samples but found ${FINAL_SAMPLES}."
+    exit 1
+fi
+
+echo
+echo "Checking final variant count against SNP + INDEL PASS counts..."
+
+SNP_COUNT=$(bcftools index -n "${SNP_PASS}")
+INDEL_COUNT=$(bcftools index -n "${INDEL_PASS}")
+FINAL_COUNT=$(bcftools index -n "${FINAL}")
+
+EXPECTED=$((SNP_COUNT + INDEL_COUNT))
+
+echo "PASS SNPs:       ${SNP_COUNT}"
+echo "PASS INDELs:     ${INDEL_COUNT}"
+echo "Expected total:  ${EXPECTED}"
+echo "Final total:     ${FINAL_COUNT}"
+
+if [[ "${FINAL_COUNT}" -ne "${EXPECTED}" ]]; then
+    echo "ERROR: Final count does not equal SNP + INDEL PASS counts."
+    exit 1
+fi
+
+
+# STEP 7: COMPLETION MARKER
+
+
+echo
+echo "Creating completion marker..."
+
+touch "${DONE}"
+
+echo
+echo "=========================================="
+echo "DRAGEN-GATK HARD FILTERING COMPLETE"
+echo "=========================================="
+echo "Finished: $(date)"
+echo "Final VCF: ${FINAL}"
+echo "Final variants: ${FINAL_COUNT}"
+echo "Final samples: ${FINAL_SAMPLES}"
+echo "=========================================="

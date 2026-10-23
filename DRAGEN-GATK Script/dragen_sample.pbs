@@ -1,0 +1,988 @@
+#!/bin/bash
+
+#PBS -N DRAGEN_GATK
+#PBS -l walltime=96:00:00
+#PBS -l select=1:ncpus=24:mem=64gb
+#PBS -M 27777197@sun.ac.za
+#PBS -m abe
+
+set -Eeuo pipefail
+
+
+# CHECK SAMPLE
+
+
+if [[ -z "${SAMPLE:-}" ]]; then
+    echo "ERROR: SAMPLE was not specified."
+    echo
+    echo "Submit with:"
+    echo "qsub -v SAMPLE=<sample_id> dragen_sample.pbs"
+    exit 1
+fi
+
+echo "============================================================"
+echo "DRAGEN-GATK PER-SAMPLE PIPELINE"
+echo "Sample: ${SAMPLE}"
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+echo "Job ID: ${PBS_JOBID:-unknown}"
+echo "============================================================"
+
+
+
+# DIRECTORIES
+
+
+BASE_DIR="${HOME}/Variantcalling"
+
+REFERENCE="${BASE_DIR}/reference/hg38.fa"
+
+FASTQ_DIR="${HOME}/fastQ_files/${SAMPLE}"
+
+
+# HOME STORAGE
+# DRAGMAP + MARKDUPLICATES + FIXRG
+
+
+HOME_DRAGEN="${BASE_DIR}/dragen_gatk"
+HOME_SAMPLE_DIR="${HOME_DRAGEN}/${SAMPLE}"
+
+# DRAGMAP reference stays in HOME
+DRAGMAP_REF="${HOME_DRAGEN}/reference"
+
+# DRAGMAP alignment output
+ALIGN_DIR="${HOME_SAMPLE_DIR}/alignment"
+
+# MarkDuplicates output
+DEDUP_DIR="${HOME_SAMPLE_DIR}/markduplicates"
+
+# FixRG output
+FIXRG_DIR="${HOME_SAMPLE_DIR}/fixrg"
+
+# DRAGMAP temporary files
+DRAGMAP_TMP="${HOME_SAMPLE_DIR}/dragmap_tmp"
+
+# MarkDuplicates spill files
+MARKDUP_TMP="${HOME_SAMPLE_DIR}/markduplicates_tmp"
+
+# Java temporary files for MarkDuplicates
+JAVA_TMP="${HOME_SAMPLE_DIR}/java_tmp"
+
+# Java temporary files for HaplotypeCaller
+HC_JAVA_TMP="${HOME_SAMPLE_DIR}/hc_java_tmp"
+
+
+
+# SCRATCH STORAGE
+# BQSR + HAPLOTYPECALLER
+
+
+SCRATCH_BASE="/stor6/scratch3/27777197"
+SCRATCH_DRAGEN="${SCRATCH_BASE}/dragen_gatk"
+SCRATCH_SAMPLE_DIR="${SCRATCH_DRAGEN}/${SAMPLE}"
+
+# BQSR output
+BQSR_DIR="${SCRATCH_SAMPLE_DIR}/bqsr"
+
+# HaplotypeCaller output
+HC_DIR="${HOME_SAMPLE_DIR}/haplotypecaller"
+
+# BQSR temporary files
+BQSR_TMP="${SCRATCH_SAMPLE_DIR}/bqsr_tmp"
+
+
+
+# CREATE DIRECTORIES
+
+
+mkdir -p \
+    "${HOME_SAMPLE_DIR}" \
+    "${ALIGN_DIR}" \
+    "${DEDUP_DIR}" \
+    "${FIXRG_DIR}" \
+    "${DRAGMAP_TMP}" \
+    "${MARKDUP_TMP}" \
+    "${JAVA_TMP}" \
+    "${HC_JAVA_TMP}" \
+    "${SCRATCH_SAMPLE_DIR}" \
+    "${BQSR_DIR}" \
+    "${HC_DIR}" \
+    "${BQSR_TMP}"
+
+
+
+# FILE NAMES
+
+
+
+# HOME
+
+
+SORTED_BAM="${ALIGN_DIR}/${SAMPLE}_sorted.bam"
+SORTED_BAI="${SORTED_BAM}.bai"
+
+DEDUP_BAM="${DEDUP_DIR}/${SAMPLE}_dedup.bam"
+DEDUP_BAI="${DEDUP_BAM}.bai"
+DUP_METRICS="${DEDUP_DIR}/${SAMPLE}_duplicate_metrics.txt"
+
+FIXED_BAM="${FIXRG_DIR}/${SAMPLE}_dedup_fixed.bam"
+FIXED_BAI="${FIXED_BAM}.bai"
+
+
+# SCRATCH
+
+
+RECAL_TABLE="${BQSR_DIR}/${SAMPLE}_recal_data.table"
+
+BQSR_BAM="${BQSR_DIR}/${SAMPLE}_bqsr.bam"
+BQSR_BAI="${BQSR_BAM}.bai"
+
+GVCF="${HC_DIR}/${SAMPLE}.g.vcf.gz"
+GVCF_TBI="${GVCF}.tbi"
+
+
+# LOG + COMPLETION MARKER
+
+
+LOG="${HOME_SAMPLE_DIR}/dragen_sample.log"
+
+DONE="${HOME_SAMPLE_DIR}/${SAMPLE}.dragen_gatk.done"
+
+exec > >(tee -a "${LOG}") 2>&1
+
+
+
+# CLEANUP
+
+
+cleanup() {
+
+    EXIT_CODE=$?
+
+    if [[ ${EXIT_CODE} -eq 0 ]]; then
+
+        echo
+        echo "Pipeline completed successfully."
+        echo "Cleaning temporary directories..."
+
+        rm -rf \
+            "${DRAGMAP_TMP}" \
+            "${MARKDUP_TMP}" \
+            "${JAVA_TMP}" \
+            "${HC_JAVA_TMP}" \
+            "${BQSR_TMP}"
+
+        echo "Temporary directories removed."
+
+    else
+
+        echo
+        echo "Pipeline failed with exit code ${EXIT_CODE}."
+        echo "Temporary files have been retained for debugging."
+
+    fi
+
+    exit ${EXIT_CODE}
+}
+
+trap cleanup EXIT
+
+
+
+# CHECK FILESYSTEMS
+
+
+echo
+echo "============================================================"
+echo "FILESYSTEM CHECK"
+echo "============================================================"
+
+echo
+echo "HOME filesystem:"
+df -h "${HOME_SAMPLE_DIR}"
+
+echo
+echo "SCRATCH filesystem:"
+df -h "${SCRATCH_SAMPLE_DIR}"
+
+echo
+echo "HOME mount:"
+findmnt -T "${HOME_SAMPLE_DIR}" \
+    -o TARGET,SOURCE,FSTYPE,OPTIONS || true
+
+echo
+echo "SCRATCH mount:"
+findmnt -T "${SCRATCH_SAMPLE_DIR}" \
+    -o TARGET,SOURCE,FSTYPE,OPTIONS || true
+
+
+
+# CHECK REFERENCE
+
+
+echo
+echo "============================================================"
+echo "CHECKING REFERENCE"
+echo "============================================================"
+
+if [[ ! -s "${REFERENCE}" ]]; then
+    echo "ERROR: Reference FASTA not found:"
+    echo "${REFERENCE}"
+    exit 1
+fi
+
+if [[ ! -s "${REFERENCE}.fai" ]]; then
+    echo "ERROR: Reference FASTA index not found:"
+    echo "${REFERENCE}.fai"
+    exit 1
+fi
+
+if [[ ! -s "${BASE_DIR}/reference/hg38.dict" ]]; then
+    echo "ERROR: Reference dictionary not found:"
+    echo "${BASE_DIR}/reference/hg38.dict"
+    exit 1
+fi
+
+echo "Reference:"
+ls -lh \
+    "${REFERENCE}" \
+    "${REFERENCE}.fai" \
+    "${BASE_DIR}/reference/hg38.dict"
+
+
+
+# CHECK DRAGMAP REFERENCE
+
+
+echo
+echo "============================================================"
+echo "CHECKING DRAGMAP REFERENCE"
+echo "============================================================"
+
+if [[ ! -d "${DRAGMAP_REF}" ]]; then
+    echo "ERROR: DRAGMAP reference directory not found:"
+    echo "${DRAGMAP_REF}"
+    exit 1
+fi
+
+if [[ ! -s "${DRAGMAP_REF}/hash_table.cfg" ]]; then
+    echo "ERROR: DRAGMAP hash table is incomplete."
+    exit 1
+fi
+
+if [[ ! -s "${DRAGMAP_REF}/hash_table.cmp" ]]; then
+    echo "ERROR: DRAGMAP hash table is incomplete."
+    exit 1
+fi
+
+if [[ ! -s "${DRAGMAP_REF}/reference.bin" ]]; then
+    echo "ERROR: DRAGMAP reference files are incomplete."
+    exit 1
+fi
+
+echo "DRAGMAP reference found:"
+ls -lh "${DRAGMAP_REF}"
+
+
+
+# LOAD MODULES
+
+
+echo
+echo "============================================================"
+echo "LOADING MODULES"
+echo "============================================================"
+
+module purge
+
+module load app/dragmap/1.3.0
+module load app/samtools/1.20
+module load app/gatk/4.6.2.0
+
+echo
+echo "DRAGMAP:"
+which dragen-os
+dragen-os --version 2>&1 || true
+
+echo
+echo "Samtools:"
+samtools --version | head -1
+
+echo
+echo "GATK:"
+gatk --version
+
+
+
+# FIND FASTQ FILES
+
+
+echo
+echo "============================================================"
+echo "FINDING FASTQ FILES"
+echo "============================================================"
+
+if [[ ! -d "${FASTQ_DIR}" ]]; then
+    echo "ERROR: FASTQ directory does not exist:"
+    echo "${FASTQ_DIR}"
+    exit 1
+fi
+
+shopt -s nullglob
+
+R1_FILES=(
+    "${FASTQ_DIR}"/*_1.fq.gz
+)
+
+shopt -u nullglob
+
+if [[ "${#R1_FILES[@]}" -eq 0 ]]; then
+    echo "ERROR: No R1 FASTQ files found."
+    echo "Directory:"
+    echo "${FASTQ_DIR}"
+    exit 1
+fi
+
+echo "Found ${#R1_FILES[@]} R1 FASTQ file(s)."
+
+R2_FILES=()
+
+for R1 in "${R1_FILES[@]}"; do
+
+    R2="${R1%_1.fq.gz}_2.fq.gz"
+
+    if [[ ! -s "${R2}" ]]; then
+        echo "ERROR: Matching R2 file not found:"
+        echo "${R2}"
+        exit 1
+    fi
+
+    R2_FILES+=("${R2}")
+
+    echo
+    echo "FASTQ PAIR:"
+    echo "  R1: ${R1}"
+    echo "  R2: ${R2}"
+
+done
+
+
+
+# CREATE COMBINED FASTQ FILES IF NECESSARY
+
+
+COMBINED_R1="${DRAGMAP_TMP}/${SAMPLE}_combined_R1.fq.gz"
+COMBINED_R2="${DRAGMAP_TMP}/${SAMPLE}_combined_R2.fq.gz"
+
+if [[ "${#R1_FILES[@]}" -eq 1 ]]; then
+
+    BWA_R1="${R1_FILES[0]}"
+    BWA_R2="${R2_FILES[0]}"
+
+    echo
+    echo "Single FASTQ pair detected."
+    echo "Using FASTQs directly."
+
+else
+
+    echo
+    echo "Multiple FASTQ pairs detected."
+    echo "Combining paired FASTQs in HOME."
+
+    rm -f "${COMBINED_R1}" "${COMBINED_R2}"
+
+    for i in "${!R1_FILES[@]}"; do
+
+        echo
+        echo "Adding FASTQ pair $((i+1)):"
+        echo "  R1: ${R1_FILES[$i]}"
+        echo "  R2: ${R2_FILES[$i]}"
+
+        cat "${R1_FILES[$i]}" >> "${COMBINED_R1}"
+        cat "${R2_FILES[$i]}" >> "${COMBINED_R2}"
+
+    done
+
+    if [[ ! -s "${COMBINED_R1}" || ! -s "${COMBINED_R2}" ]]; then
+        echo "ERROR: Combined FASTQ files were not created."
+        exit 1
+    fi
+
+    BWA_R1="${COMBINED_R1}"
+    BWA_R2="${COMBINED_R2}"
+
+    echo
+    echo "Combined FASTQs:"
+    ls -lh "${BWA_R1}" "${BWA_R2}"
+
+fi
+
+
+
+# READ GROUP
+
+
+RGID="${SAMPLE}"
+RGSM="${SAMPLE}"
+
+echo
+echo "Read group:"
+printf '@RG\tID:%s\tSM:%s\n' "${RGID}" "${RGSM}"
+
+
+
+# STEP 1 — DRAGMAP ALIGNMENT + SORTING
+
+
+if [[ -s "${SORTED_BAM}" && -s "${SORTED_BAI}" ]]; then
+
+    echo
+    echo "============================================================"
+    echo "DRAGMAP ALIGNMENT ALREADY COMPLETED"
+    echo "Skipping alignment."
+    echo "============================================================"
+
+    ls -lh "${SORTED_BAM}" "${SORTED_BAI}"
+
+else
+
+    echo
+    echo "============================================================"
+    echo "STEP 1: DRAGMAP ALIGNMENT"
+    echo "============================================================"
+
+    rm -f "${SORTED_BAM}" "${SORTED_BAI}"
+
+    dragen-os \
+        -r "${DRAGMAP_REF}" \
+        -1 "${BWA_R1}" \
+        -2 "${BWA_R2}" \
+        --num-threads 24 \
+        --RGID "${RGID}" \
+        --RGSM "${RGSM}" \
+        2> "${ALIGN_DIR}/${SAMPLE}_dragmap.log" \
+        | samtools sort \
+            -@ 24 \
+            -T "${DRAGMAP_TMP}/${SAMPLE}.sort" \
+            -O BAM \
+            -o "${SORTED_BAM}" -
+
+    if [[ ! -s "${SORTED_BAM}" ]]; then
+        echo "ERROR: DRAGMAP/samtools produced no sorted BAM."
+        exit 1
+    fi
+
+    echo
+    echo "Indexing sorted BAM..."
+
+    samtools index \
+        -@ 8 \
+        "${SORTED_BAM}" \
+        "${SORTED_BAI}"
+
+    if [[ ! -s "${SORTED_BAI}" ]]; then
+        echo "ERROR: BAM index was not created."
+        exit 1
+    fi
+
+fi
+
+echo
+echo "Sorted BAM:"
+ls -lh "${SORTED_BAM}" "${SORTED_BAI}"
+
+echo
+echo "Checking BAM:"
+samtools quickcheck "${SORTED_BAM}"
+
+
+
+# STEP 2 — MARK DUPLICATES
+
+
+if [[ -s "${DEDUP_BAM}" && -s "${DUP_METRICS}" ]]; then
+
+    echo
+    echo "============================================================"
+    echo "MARKDUPLICATES ALREADY COMPLETED"
+    echo "Skipping MarkDuplicates."
+    echo "============================================================"
+
+    ls -lh "${DEDUP_BAM}" "${DUP_METRICS}"
+
+else
+
+    echo
+    echo "============================================================"
+    echo "STEP 2: GATK MARKDUPLICATES"
+    echo "============================================================"
+
+    rm -f "${DEDUP_BAM}" "${DUP_METRICS}"
+
+    gatk \
+        --java-options \
+        "-Xmx48g \
+         -Djava.io.tmpdir=${JAVA_TMP} \
+         -Dorg.xerial.snappy.tempdir=${JAVA_TMP}" \
+        MarkDuplicates \
+        -I "${SORTED_BAM}" \
+        -O "${DEDUP_BAM}" \
+        -M "${DUP_METRICS}" \
+        --TMP_DIR "${MARKDUP_TMP}" \
+        --CREATE_INDEX false \
+        --MAX_RECORDS_IN_RAM 8000000
+
+    if [[ ! -s "${DEDUP_BAM}" ]]; then
+        echo "ERROR: Deduplicated BAM was not created."
+        exit 1
+    fi
+
+    if [[ ! -s "${DUP_METRICS}" ]]; then
+        echo "ERROR: Duplicate metrics were not created."
+        exit 1
+    fi
+
+fi
+
+echo
+echo "Deduplicated BAM:"
+ls -lh "${DEDUP_BAM}"
+
+echo
+echo "Checking deduplicated BAM:"
+samtools quickcheck "${DEDUP_BAM}"
+
+
+
+# STEP 3 — INDEX DEDUPLICATED BAM
+
+
+if [[ -s "${DEDUP_BAI}" ]]; then
+
+    echo
+    echo "Deduplicated BAM index already exists."
+    ls -lh "${DEDUP_BAI}"
+
+else
+
+    echo
+    echo "============================================================"
+    echo "STEP 3: INDEX DEDUPLICATED BAM"
+    echo "============================================================"
+
+    samtools index \
+        -@ 8 \
+        "${DEDUP_BAM}" \
+        "${DEDUP_BAI}"
+
+    if [[ ! -s "${DEDUP_BAI}" ]]; then
+        echo "ERROR: Deduplicated BAM index was not created."
+        exit 1
+    fi
+
+fi
+
+
+
+# STEP 4 — FIX READ GROUP PLATFORM
+
+
+if [[ -s "${FIXED_BAM}" && -s "${FIXED_BAI}" ]]; then
+
+    echo
+    echo "============================================================"
+    echo "FIXRG ALREADY COMPLETED"
+    echo "Skipping FixRG."
+    echo "============================================================"
+
+else
+
+    echo
+    echo "============================================================"
+    echo "STEP 4: FIX READ GROUP PLATFORM"
+    echo "============================================================"
+
+    rm -f "${FIXED_BAM}" "${FIXED_BAI}"
+
+    HEADER="${FIXRG_DIR}/${SAMPLE}_fixed_header.sam"
+
+    echo "Original read group:"
+    samtools view -H "${DEDUP_BAM}" | grep '^@RG' || true
+
+    echo
+    echo "Creating corrected header..."
+
+    samtools view -H "${DEDUP_BAM}" \
+        | sed 's/\tPL:MGI\t/\tPL:DNBSEQ\tPM:MGI\t/' \
+        > "${HEADER}"
+
+    echo
+    echo "Corrected header:"
+    grep '^@RG' "${HEADER}"
+
+    echo
+    echo "Creating corrected BAM..."
+
+    samtools reheader \
+        "${HEADER}" \
+        "${DEDUP_BAM}" \
+        > "${FIXED_BAM}"
+
+    rm -f "${HEADER}"
+
+    samtools index \
+        -@ 8 \
+        "${FIXED_BAM}" \
+        "${FIXED_BAI}"
+
+    if [[ ! -s "${FIXED_BAM}" ]]; then
+        echo "ERROR: Fixed BAM was not created."
+        exit 1
+    fi
+
+    if [[ ! -s "${FIXED_BAI}" ]]; then
+        echo "ERROR: Fixed BAM index was not created."
+        exit 1
+    fi
+
+fi
+
+echo
+echo "Corrected read group:"
+samtools view -H "${FIXED_BAM}" | grep '^@RG'
+
+echo
+echo "Fixed BAM:"
+ls -lh "${FIXED_BAM}" "${FIXED_BAI}"
+
+
+
+# CHECK BQSR RESOURCES
+
+
+BQSR_REF_DIR="${BASE_DIR}/reference/bqsr"
+
+DBSNP="${BQSR_REF_DIR}/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+DBSNP_TBI="${DBSNP}.tbi"
+
+MILLS="${BQSR_REF_DIR}/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+MILLS_TBI="${MILLS}.tbi"
+
+KNOWN_INDELS="${BQSR_REF_DIR}/Homo_sapiens_assembly38.known_indels.vcf.gz"
+KNOWN_INDELS_TBI="${KNOWN_INDELS}.tbi"
+
+echo
+echo "============================================================"
+echo "CHECKING BQSR RESOURCES"
+echo "============================================================"
+
+for FILE in \
+    "${DBSNP}" \
+    "${DBSNP_TBI}" \
+    "${MILLS}" \
+    "${MILLS_TBI}" \
+    "${KNOWN_INDELS}" \
+    "${KNOWN_INDELS_TBI}"
+do
+
+    if [[ ! -s "${FILE}" ]]; then
+        echo "ERROR: BQSR resource missing:"
+        echo "${FILE}"
+        exit 1
+    fi
+
+done
+
+echo "All BQSR resources found."
+
+
+
+# STEP 5 — BASE RECALIBRATOR
+
+
+if [[ -s "${RECAL_TABLE}" ]]; then
+
+    echo
+    echo "============================================================"
+    echo "BASE RECALIBRATOR ALREADY COMPLETED"
+    echo "Skipping BaseRecalibrator."
+    echo "============================================================"
+
+else
+
+    echo
+    echo "============================================================"
+    echo "STEP 5: BASE RECALIBRATOR"
+    echo "============================================================"
+
+    gatk \
+        --java-options \
+        "-Xmx24g \
+         -Djava.io.tmpdir=${JAVA_TMP}" \
+        BaseRecalibrator \
+        -R "${REFERENCE}" \
+        -I "${FIXED_BAM}" \
+        --known-sites "${DBSNP}" \
+        --known-sites "${MILLS}" \
+        --known-sites "${KNOWN_INDELS}" \
+        --tmp-dir "${BQSR_TMP}" \
+        -O "${RECAL_TABLE}"
+
+    if [[ ! -s "${RECAL_TABLE}" ]]; then
+        echo "ERROR: Recalibration table was not created."
+        exit 1
+    fi
+
+fi
+
+
+
+# STEP 6 — APPLY BQSR
+
+
+if [[ -s "${BQSR_BAM}" ]]; then
+
+    echo
+    echo "============================================================"
+    echo "APPLY BQSR ALREADY COMPLETED"
+    echo "Skipping ApplyBQSR."
+    echo "============================================================"
+
+else
+
+    echo
+    echo "============================================================"
+    echo "STEP 6: APPLY BQSR"
+    echo "============================================================"
+
+    TMP_BQSR_BAM="${BQSR_TMP}/${SAMPLE}_bqsr.tmp.bam"
+
+    rm -f "${TMP_BQSR_BAM}"
+
+    gatk \
+        --java-options \
+        "-Xmx24g \
+         -Djava.io.tmpdir=${JAVA_TMP}" \
+        ApplyBQSR \
+        -R "${REFERENCE}" \
+        -I "${FIXED_BAM}" \
+        --bqsr-recal-file "${RECAL_TABLE}" \
+        --tmp-dir "${BQSR_TMP}" \
+        -O "${TMP_BQSR_BAM}"
+
+    if [[ ! -s "${TMP_BQSR_BAM}" ]]; then
+        echo "ERROR: ApplyBQSR did not produce a BAM."
+        exit 1
+    fi
+
+    mv "${TMP_BQSR_BAM}" "${BQSR_BAM}"
+
+fi
+
+
+
+# STEP 7 — INDEX BQSR BAM
+
+
+if [[ -s "${BQSR_BAI}" ]]; then
+
+    echo
+    echo "BQSR BAM index already exists."
+
+else
+
+    echo
+    echo "============================================================"
+    echo "STEP 7: INDEX BQSR BAM"
+    echo "============================================================"
+
+    samtools index \
+        -@ 8 \
+        "${BQSR_BAM}" \
+        "${BQSR_BAI}"
+
+    if [[ ! -s "${BQSR_BAI}" ]]; then
+        echo "ERROR: BQSR BAM index was not created."
+        exit 1
+    fi
+
+fi
+
+echo
+echo "BQSR BAM:"
+ls -lh "${BQSR_BAM}" "${BQSR_BAI}"
+
+samtools quickcheck "${BQSR_BAM}"
+
+
+
+# STEP 8 — HAPLOTYPECALLER
+
+
+if [[ -s "${GVCF}" && -s "${GVCF_TBI}" ]]; then
+
+    echo
+    echo "============================================================"
+    echo "HAPLOTYPECALLER ALREADY COMPLETED"
+    echo "Skipping HaplotypeCaller."
+    echo "============================================================"
+
+    ls -lh "${GVCF}" "${GVCF_TBI}"
+
+else
+
+    echo
+    echo "============================================================"
+    echo "STEP 8: GATK HAPLOTYPECALLER"
+    echo "============================================================"
+
+    rm -f "${GVCF}" "${GVCF_TBI}"
+
+    gatk \
+        --java-options \
+        "-Xmx56g \
+         -Djava.io.tmpdir=${HC_JAVA_TMP}" \
+        HaplotypeCaller \
+        -R "${REFERENCE}" \
+        -I "${BQSR_BAM}" \
+        -O "${GVCF}" \
+        -ERC GVCF \
+        --native-pair-hmm-threads 16
+
+    if [[ ! -s "${GVCF}" ]]; then
+        echo "ERROR: HaplotypeCaller did not produce gVCF."
+        exit 1
+    fi
+
+    if [[ ! -s "${GVCF_TBI}" ]]; then
+        echo "ERROR: gVCF index was not created."
+        exit 1
+    fi
+
+fi
+
+
+
+# FINAL VALIDATION
+
+
+echo
+echo "============================================================"
+echo "FINAL VALIDATION"
+echo "============================================================"
+
+for FILE in \
+    "${SORTED_BAM}" \
+    "${SORTED_BAI}" \
+    "${DEDUP_BAM}" \
+    "${DEDUP_BAI}" \
+    "${FIXED_BAM}" \
+    "${FIXED_BAI}" \
+    "${RECAL_TABLE}" \
+    "${BQSR_BAM}" \
+    "${BQSR_BAI}" \
+    "${GVCF}" \
+    "${GVCF_TBI}"
+do
+
+    if [[ ! -s "${FILE}" ]]; then
+        echo "ERROR: Required output missing:"
+        echo "${FILE}"
+        exit 1
+    fi
+
+done
+
+
+echo
+echo "Checking final BQSR BAM:"
+samtools quickcheck "${BQSR_BAM}"
+
+
+echo
+echo "Checking final BAM index:"
+samtools idxstats "${BQSR_BAM}" > /dev/null
+
+
+echo
+echo "Checking gVCF:"
+
+if [[ ! -s "${GVCF}" ]]; then
+    echo "ERROR: gVCF is missing or empty:"
+    echo "${GVCF}"
+    exit 1
+fi
+
+if [[ ! -s "${GVCF_TBI}" ]]; then
+    echo "ERROR: gVCF index is missing:"
+    echo "${GVCF_TBI}"
+    exit 1
+fi
+
+echo "gVCF and index present."
+
+
+
+# COMPLETION MARKER
+
+
+{
+    echo "Sample: ${SAMPLE}"
+    echo "Status: DRAGEN-GATK pipeline completed successfully"
+    echo "Date: $(date)"
+    echo "Node: $(hostname)"
+    echo "Job ID: ${PBS_JOBID:-unknown}"
+    echo
+    echo "DRAGMAP sorted BAM: ${SORTED_BAM}"
+    echo "Deduplicated BAM: ${DEDUP_BAM}"
+    echo "Fixed RG BAM: ${FIXED_BAM}"
+    echo "BQSR BAM: ${BQSR_BAM}"
+    echo "gVCF: ${GVCF}"
+} > "${DONE}"
+
+
+
+# FINAL SUMMARY
+
+
+echo
+echo "============================================================"
+echo "DRAGEN-GATK PIPELINE COMPLETED SUCCESSFULLY"
+echo "============================================================"
+
+echo
+echo "Sample:"
+echo "${SAMPLE}"
+
+echo
+echo "HOME outputs:"
+echo
+echo "Sorted BAM:"
+ls -lh "${SORTED_BAM}" "${SORTED_BAI}"
+
+echo
+echo "Deduplicated BAM:"
+ls -lh "${DEDUP_BAM}" "${DEDUP_BAI}"
+
+echo
+echo "Fixed RG BAM:"
+ls -lh "${FIXED_BAM}" "${FIXED_BAI}"
+
+echo
+echo "SCRATCH outputs:"
+echo
+echo "BQSR BAM:"
+ls -lh "${BQSR_BAM}" "${BQSR_BAI}"
+
+echo
+echo "Final gVCF:"
+ls -lh "${GVCF}" "${GVCF_TBI}"
+
+echo
+echo "Completion marker:"
+ls -lh "${DONE}"
+
+echo
+echo "Finished: $(date)"
+
+echo "============================================================"

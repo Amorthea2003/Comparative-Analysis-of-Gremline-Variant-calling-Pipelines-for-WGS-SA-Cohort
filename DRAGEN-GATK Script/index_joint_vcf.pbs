@@ -1,0 +1,35 @@
+#!/bin/bash
+#PBS -N DRAGEN_GATK_INDEX
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=2:mem=8gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/gatk/4.6.2.0
+
+INPUT="/stor6/scratch3/27777197/dragen_gatk_cohort/output/joint.vcf.gz"
+
+echo "=========================================="
+echo "DRAGEN-GATK VCF INDEXING"
+echo "=========================================="
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+echo "Input: ${INPUT}"
+echo "=========================================="
+
+test -s "${INPUT}"
+
+gatk IndexFeatureFile \
+    -I "${INPUT}"
+
+echo
+echo "Checking index:"
+ls -lh "${INPUT}"*
+
+echo
+echo "=========================================="
+echo "INDEXING COMPLETE"
+echo "Finished: $(date)"
+echo "=========================================="

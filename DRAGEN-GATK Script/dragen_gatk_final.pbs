@@ -1,0 +1,139 @@
+#!/bin/bash
+#PBS -N DRAGEN_GATK_Final
+#PBS -l walltime=06:00:00
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/bcftools/1.19
+
+BASE_DIR="${HOME}/Variantcalling"
+COHORT_DIR="/stor6/scratch3/27777197/dragen_gatk_cohort"
+OUTPUT_DIR="${COHORT_DIR}/output"
+GENOTYPED_DIR="${COHORT_DIR}/genotyped"
+REFERENCE="${BASE_DIR}/reference/hg38.fa"
+DICT="${BASE_DIR}/reference/hg38.dict"
+
+FINAL="${OUTPUT_DIR}/joint.vcf.gz"
+FINAL_CSI="${FINAL}.csi"
+DONE="${OUTPUT_DIR}/DRAGMAP_GATK_FINAL.done"
+
+TMP_DIR="${TMPDIR}/dragen_gatk_final"
+
+mkdir -p "${OUTPUT_DIR}" "${TMP_DIR}"
+
+echo "=========================================="
+echo "DRAGMAP + GATK FINAL ASSEMBLY"
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+echo "=========================================="
+
+test -s "${REFERENCE}"
+test -s "${REFERENCE}.fai"
+test -s "${DICT}"
+
+for i in $(seq -w 1 12); do
+    VCF="${GENOTYPED_DIR}/dragen_gatk_batch_${i}.vcf.gz"
+
+    test -s "${VCF}"
+
+    if [[ ! -s "${VCF}.tbi" && ! -s "${VCF}.csi" ]]; then
+        echo "ERROR: Missing index for ${VCF}"
+        exit 1
+    fi
+done
+
+if [[ -e "${DONE}" ]]; then
+    echo "ERROR: Final DONE marker already exists:"
+    echo "${DONE}"
+    exit 1
+fi
+
+if [[ -e "${FINAL}" ]]; then
+    echo "ERROR: Final output already exists:"
+    echo "${FINAL}"
+    exit 1
+fi
+
+CONCAT="${TMP_DIR}/dragen_gatk_concat.vcf.gz"
+SORTED="${TMP_DIR}/dragen_gatk_sorted.vcf.gz"
+
+echo
+echo "Step 1: Concatenating 12 batch VCFs..."
+
+bcftools concat \
+    --allow-overlaps \
+    -Oz \
+    -o "${CONCAT}" \
+    $(for i in $(seq -w 1 12); do
+        printf '%s ' "${GENOTYPED_DIR}/dragen_gatk_batch_${i}.vcf.gz"
+      done)
+
+bcftools index --tbi "${CONCAT}"
+
+test -s "${CONCAT}"
+test -s "${CONCAT}.tbi"
+
+echo
+echo "Step 2: Sorting according to hg38 reference dictionary..."
+
+bcftools sort \
+    -Oz \
+    -o "${SORTED}" \
+    "${CONCAT}"
+
+test -s "${SORTED}"
+
+echo
+echo "Step 3: Creating final output..."
+
+mv "${SORTED}" "${FINAL}"
+
+echo
+echo "Step 4: Creating final CSI index..."
+
+bcftools index \
+    --csi \
+    "${FINAL}"
+
+test -s "${FINAL}"
+test -s "${FINAL_CSI}"
+
+echo
+echo "Step 5: Validating final VCF..."
+
+SAMPLES=$(bcftools query -l "${FINAL}" | wc -l)
+VARIANTS=$(bcftools view -H "${FINAL}" | wc -l)
+
+echo "Samples: ${SAMPLES}"
+echo "Variants: ${VARIANTS}"
+
+if [[ "${SAMPLES}" -ne 44 ]]; then
+    echo "ERROR: Expected 44 samples, found ${SAMPLES}"
+    exit 1
+fi
+
+if [[ "${VARIANTS}" -eq 0 ]]; then
+    echo "ERROR: Final VCF contains zero variants"
+    exit 1
+fi
+
+bcftools view -h "${FINAL}" >/dev/null
+
+echo
+echo "Step 6: Final validation passed."
+
+touch "${DONE}"
+
+echo
+echo "=========================================="
+echo "SUCCESS"
+echo "Final VCF: ${FINAL}"
+echo "Final CSI: ${FINAL_CSI}"
+echo "Samples: ${SAMPLES}"
+echo "Variants: ${VARIANTS}"
+echo "Done marker: ${DONE}"
+echo "Finish: $(date)"
+echo "=========================================="
