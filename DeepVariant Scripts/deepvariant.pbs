@@ -1,0 +1,581 @@
+#!/bin/bash
+#PBS -N DeepVariant
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -l walltime=48:00:00
+#PBS -M 27777197@sun.ac.za
+#PBS -m abe
+
+set -Eeuo pipefail
+
+
+# SAMPLE
+
+
+if [[ -z "${SAMPLE:-}" ]]; then
+    echo "ERROR: SAMPLE was not provided."
+    echo "Submit with: qsub -v SAMPLE=1001 deepvariant.pbs"
+    exit 1
+fi
+
+
+# DIRECTORIES
+
+
+BASE_DIR="${HOME}/Variantcalling"
+SAMPLE_DIR="${BASE_DIR}/deepvariant/${SAMPLE}"
+FASTQ_DIR="${HOME}/fastQ_files/${SAMPLE}"
+REF_DIR="${BASE_DIR}/reference"
+
+REFERENCE="${REF_DIR}/hg38.fa"
+
+SCRATCH_BASE="/stor6/scratch3/27777197"
+SAMPLE_SCRATCH="${SCRATCH_BASE}/deepvariant/${SAMPLE}"
+
+# Large DeepVariant intermediate data goes here.
+DV_TMP="${SAMPLE_SCRATCH}/deepvariant_tmp"
+
+# BWA/samtools temporary files.
+BWA_TMP="${SAMPLE_SCRATCH}/bwa_tmp"
+SAMTOOLS_TMP="${SAMPLE_SCRATCH}/samtools_tmp"
+
+# IMPORTANT:
+# This is LOCAL NODE /tmp.
+# It must NOT be replaced with the noexec scratch filesystem.
+LOCAL_TMP="/tmp/${USER}_${SAMPLE}_${PBS_JOBID:-$$}"
+
+OUTPUT_DIR="${SAMPLE_SCRATCH}/deepvariant_output"
+
+
+# FILES
+
+
+BAM="${SAMPLE_SCRATCH}/${SAMPLE}.sorted.bam"
+BAI="${BAM}.bai"
+
+VCF="${OUTPUT_DIR}/${SAMPLE}.vcf.gz"
+GVCF="${OUTPUT_DIR}/${SAMPLE}.g.vcf.gz"
+
+
+# CREATE DIRECTORIES
+
+
+mkdir -p \
+    "${SAMPLE_DIR}" \
+    "${SAMPLE_SCRATCH}" \
+    "${DV_TMP}" \
+    "${BWA_TMP}" \
+    "${SAMTOOLS_TMP}" \
+    "${OUTPUT_DIR}" \
+    "${LOCAL_TMP}"
+
+LOG="${SAMPLE_DIR}/deepvariant.log"
+
+exec > >(tee -a "${LOG}") 2>&1
+
+echo "============================================================"
+echo "DEEPVARIANT JOB START"
+echo "============================================================"
+echo "Sample:       ${SAMPLE}"
+echo "Job ID:       ${PBS_JOBID:-unknown}"
+echo "Host:         $(hostname)"
+echo "Date:         $(date)"
+echo "Scratch:      ${SAMPLE_SCRATCH}"
+echo "BAM:          ${BAM}"
+echo "VCF:          ${VCF}"
+echo "GVCF:         ${GVCF}"
+echo "============================================================"
+
+
+# CLEANUP
+
+
+cleanup() {
+    EXIT_CODE=$?
+
+    echo
+    echo "============================================================"
+    echo "DEEPVARIANT JOB EXIT"
+    echo "============================================================"
+    echo "Sample: ${SAMPLE}"
+    echo "Exit code: ${EXIT_CODE}"
+    echo "Date: $(date)"
+    echo "Host: $(hostname)"
+    echo "============================================================"
+
+    if [[ "${EXIT_CODE}" -eq 0 ]]; then
+        echo "JOB COMPLETED SUCCESSFULLY."
+
+        # Remove only temporary scratch directories.
+        rm -rf "${DV_TMP}" "${BWA_TMP}" "${SAMTOOLS_TMP}" "${LOCAL_TMP}" || true
+
+    else
+        echo "JOB FAILED."
+        echo
+        echo "Scratch directory has been KEPT for debugging:"
+        echo "${SAMPLE_SCRATCH}"
+        echo
+        echo "Node /tmp has been cleaned:"
+        echo "${LOCAL_TMP}"
+        rm -rf "${LOCAL_TMP}" || true
+    fi
+}
+
+trap cleanup EXIT
+
+
+# SCRATCH CHECK
+
+
+echo
+echo "Checking scratch filesystem..."
+
+touch "${SAMPLE_SCRATCH}/.scratch_test"
+rm -f "${SAMPLE_SCRATCH}/.scratch_test"
+
+echo "Scratch is writable."
+
+echo
+echo "Scratch filesystem:"
+df -h "${SAMPLE_SCRATCH}"
+
+echo
+echo "Node /tmp filesystem:"
+df -h /tmp
+
+
+# IMPORTANT TMP CONFIGURATION
+
+
+echo
+echo "Configuring temporary directories..."
+
+# IMPORTANT:
+# /tmp is the EXECUTABLE runtime area.
+# Do NOT point it at scratch3 because scratch3 is mounted noexec.
+
+export TMPDIR="${LOCAL_TMP}"
+export TMP="${LOCAL_TMP}"
+export TEMP="${LOCAL_TMP}"
+
+# Apptainer's own temporary/cache files also stay on local node /tmp.
+export APPTAINER_TMPDIR="${LOCAL_TMP}"
+export APPTAINER_CACHEDIR="${LOCAL_TMP}/apptainer_cache"
+
+mkdir -p "${LOCAL_TMP}" "${APPTAINER_CACHEDIR}"
+
+echo "Host TMPDIR: ${TMPDIR}"
+echo "Host TMP:    ${TMP}"
+echo "Host TEMP:   ${TEMP}"
+echo "Apptainer TMP: ${APPTAINER_TMPDIR}"
+
+
+# TEST THAT NODE /tmp IS EXECUTABLE
+
+
+echo
+echo "Testing executable node /tmp..."
+
+TEST_SCRIPT="${LOCAL_TMP}/test_exec.sh"
+
+cat > "${TEST_SCRIPT}" <<'EOF'
+#!/bin/bash
+echo "EXEC_TEST_OK"
+EOF
+
+chmod +x "${TEST_SCRIPT}"
+
+if [[ "$("${TEST_SCRIPT}")" != "EXEC_TEST_OK" ]]; then
+    echo "ERROR: Node /tmp is not executable."
+    exit 1
+fi
+
+echo "Node /tmp executable test: PASS"
+
+
+# MODULES
+
+
+echo
+echo "Loading modules..."
+
+module purge
+
+module load app/bwa/0.7.18
+module load app/samtools/1.20
+module load app/bcftools/1.19
+module load app/deepvariant/1.9
+
+echo
+echo "Loaded modules:"
+module list 2>&1 || true
+
+
+# APPTAINER / SINGULARITY
+
+
+if command -v apptainer >/dev/null 2>&1; then
+    CONTAINER_CMD="apptainer"
+elif command -v singularity >/dev/null 2>&1; then
+    CONTAINER_CMD="singularity"
+else
+    echo "ERROR: Neither Apptainer nor Singularity is available."
+    exit 1
+fi
+
+echo
+echo "Container command: ${CONTAINER_CMD}"
+
+SIF_FILE="/apps2/deepvariant/singularity/deepvariant.sif"
+
+if [[ ! -f "${SIF_FILE}" ]]; then
+    echo "ERROR: DeepVariant SIF not found:"
+    echo "${SIF_FILE}"
+    exit 1
+fi
+
+echo "DeepVariant SIF:"
+ls -lh "${SIF_FILE}"
+
+
+# FASTQ CHECK
+
+
+echo
+echo "Checking FASTQ files..."
+
+shopt -s nullglob
+
+R1_FILES=("${FASTQ_DIR}"/*_1.fq.gz)
+R2_FILES=("${FASTQ_DIR}"/*_2.fq.gz)
+
+if [[ "${#R1_FILES[@]}" -eq 0 ]]; then
+    echo "ERROR: No R1 FASTQ files found."
+    echo "${FASTQ_DIR}"
+    exit 1
+fi
+
+if [[ "${#R1_FILES[@]}" -ne "${#R2_FILES[@]}" ]]; then
+    echo "ERROR: R1/R2 FASTQ count mismatch."
+    echo "R1: ${#R1_FILES[@]}"
+    echo "R2: ${#R2_FILES[@]}"
+    exit 1
+fi
+
+echo "R1 files: ${#R1_FILES[@]}"
+echo "R2 files: ${#R2_FILES[@]}"
+
+for r1 in "${R1_FILES[@]}"; do
+
+    r2="${r1%_1.fq.gz}_2.fq.gz"
+
+    if [[ ! -f "${r2}" ]]; then
+        echo "ERROR: Matching R2 file not found."
+        echo "R1: ${r1}"
+        echo "Expected R2: ${r2}"
+        exit 1
+    fi
+
+    echo "PAIR:"
+    echo "  R1: ${r1}"
+    echo "  R2: ${r2}"
+
+done
+
+
+# REFERENCE CHECK
+
+
+echo
+echo "Checking reference..."
+
+if [[ ! -f "${REFERENCE}" ]]; then
+    echo "ERROR: Reference not found:"
+    echo "${REFERENCE}"
+    exit 1
+fi
+
+if [[ ! -f "${REFERENCE}.fai" ]]; then
+    echo "ERROR: Reference index not found:"
+    echo "${REFERENCE}.fai"
+    exit 1
+fi
+
+DICT="${REFERENCE%.fa}.dict"
+
+if [[ ! -f "${DICT}" ]]; then
+    echo "ERROR: Reference dictionary not found:"
+    echo "${DICT}"
+    exit 1
+fi
+
+echo "Reference: ${REFERENCE}"
+echo "Reference OK."
+
+COMBINED_R1="${BWA_TMP}/${SAMPLE}_combined_R1.fq.gz"
+COMBINED_R2="${BWA_TMP}/${SAMPLE}_combined_R2.fq.gz"
+
+if [[ "${#R1_FILES[@]}" -eq 1 ]]; then
+
+    BWA_R1="${R1_FILES[0]}"
+    BWA_R2="${R2_FILES[0]}"
+
+    echo
+    echo "Single FASTQ pair detected."
+    echo "Using FASTQs directly."
+
+else
+
+    echo
+    echo "Multiple FASTQ pairs detected."
+    echo "Combining paired FASTQ files..."
+
+    rm -f "${COMBINED_R1}" "${COMBINED_R2}"
+
+    for r1 in "${R1_FILES[@]}"; do
+        r2="${r1%_1.fq.gz}_2.fq.gz"
+
+        echo "Adding pair:"
+        echo "  R1: ${r1}"
+        echo "  R2: ${r2}"
+
+        cat "${r1}" >> "${COMBINED_R1}"
+        cat "${r2}" >> "${COMBINED_R2}"
+    done
+
+    BWA_R1="${COMBINED_R1}"
+    BWA_R2="${COMBINED_R2}"
+
+    echo
+    echo "Combined FASTQs:"
+    ls -lh "${BWA_R1}" "${BWA_R2}"
+
+fi
+
+
+# BAM
+
+
+echo
+echo "Checking BAM..."
+
+if [[ -f "${BAM}" && -f "${BAI}" ]]; then
+
+    echo "Existing scratch BAM found:"
+    ls -lh "${BAM}" "${BAI}"
+
+    echo "Running samtools quickcheck..."
+
+    if ! samtools quickcheck -v "${BAM}"; then
+        echo "ERROR: Existing BAM failed samtools quickcheck."
+        exit 1
+    fi
+
+    echo "Existing BAM is valid."
+    echo "BWA stage will NOT be repeated."
+
+else
+
+    echo "No complete scratch BAM found."
+    echo "Starting BWA-MEM + sorting..."
+
+    RG="@RG\tID:${SAMPLE}\tLB:lib1\tPL:MGI\tPU:unit1\tSM:${SAMPLE}"
+
+    bwa mem \
+        -t 12 \
+        -R "${RG}" \
+        "${REFERENCE}" \
+        "${BWA_R1}" \
+        "${BWA_R2}" \
+        | samtools sort \
+            -@ 4 \
+            -T "${SAMTOOLS_TMP}/${SAMPLE}.sort" \
+            -o "${BAM}" \
+            -
+
+    echo "BWA + sorting completed."
+
+    samtools index \
+        -@ 8 \
+        "${BAM}"
+
+    echo "BAM indexing completed."
+
+fi
+
+
+# REMOVE TEMPORARY COMBINED FASTQS
+
+
+if [[ -f "${COMBINED_R1}" ]]; then
+    rm -f "${COMBINED_R1}"
+fi
+
+if [[ -f "${COMBINED_R2}" ]]; then
+    rm -f "${COMBINED_R2}"
+fi
+
+
+# BAM VALIDATION
+
+
+echo
+echo "Validating BAM..."
+
+samtools quickcheck -v "${BAM}"
+
+echo "BAM size:"
+ls -lh "${BAM}" "${BAI}"
+
+echo
+echo "BAM read groups:"
+
+samtools view -H "${BAM}" | grep '^@RG' || true
+
+echo
+echo "Checking sample name..."
+
+if ! samtools view -H "${BAM}" | grep -q "SM:${SAMPLE}"; then
+    echo "ERROR: BAM does not contain SM:${SAMPLE}"
+    exit 1
+fi
+
+echo "SM:${SAMPLE} found."
+
+
+# DEEPVARIANT OUTPUT
+
+
+echo
+echo "Preparing DeepVariant output..."
+
+mkdir -p "${OUTPUT_DIR}"
+
+if [[ -s "${VCF}" && -s "${VCF}.tbi" && \
+      -s "${GVCF}" && -s "${GVCF}.tbi" ]]; then
+
+    echo "Complete DeepVariant output already exists."
+    echo "VCF:"
+    ls -lh "${VCF}" "${VCF}.tbi"
+
+    echo "gVCF:"
+    ls -lh "${GVCF}" "${GVCF}.tbi"
+
+    echo "DeepVariant will NOT be rerun."
+
+    touch "${SAMPLE_SCRATCH}/deepvariant.done"
+    touch "${SAMPLE_SCRATCH}/deepvariant_calling.done"
+
+    exit 0
+
+fi
+
+echo "No complete DeepVariant output found."
+
+rm -f "${VCF}" "${VCF}.tbi"
+rm -f "${GVCF}" "${GVCF}.tbi"
+
+
+# DEEPVARIANT
+
+
+echo
+echo "============================================================"
+echo "STARTING DEEPVARIANT"
+echo "============================================================"
+
+echo "Model: WGS"
+echo "BAM: ${BAM}"
+echo "Intermediate results: ${DV_TMP}"
+echo "Output directory: ${OUTPUT_DIR}"
+echo "Node runtime TMP: ${LOCAL_TMP}"
+
+echo
+echo "Starting DeepVariant..."
+
+"${CONTAINER_CMD}" exec \
+    --cleanenv \
+    --env "TMPDIR=${LOCAL_TMP}" \
+    --env "TMP=${LOCAL_TMP}" \
+    --env "TEMP=${LOCAL_TMP}" \
+    --env "APPTAINER_TMPDIR=${LOCAL_TMP}" \
+    --bind "${HOME}:${HOME}" \
+    --bind "${SCRATCH_BASE}:${SCRATCH_BASE}" \
+    "${SIF_FILE}" \
+    run_deepvariant \
+        --model_type=WGS \
+        --ref="${REFERENCE}" \
+        --reads="${BAM}" \
+        --output_vcf="${VCF}" \
+        --output_gvcf="${GVCF}" \
+        --intermediate_results_dir="${DV_TMP}" \
+        --num_shards=16
+
+echo
+echo "DeepVariant command completed."
+
+
+# VCF VALIDATION
+
+
+echo
+echo "Validating VCF..."
+
+if [[ ! -s "${VCF}" ]]; then
+    echo "ERROR: VCF was not created."
+    exit 1
+fi
+
+if [[ ! -s "${GVCF}" ]]; then
+    echo "ERROR: gVCF was not created."
+    exit 1
+fi
+
+echo "VCF:"
+ls -lh "${VCF}"
+
+echo "gVCF:"
+ls -lh "${GVCF}"
+
+
+# INDEX
+
+
+echo
+echo "Indexing VCF..."
+
+bcftools index -t "${VCF}"
+bcftools index -t "${GVCF}"
+
+echo "VCF indexes created."
+
+
+# FINAL VALIDATION
+
+
+echo
+echo "Final output files:"
+
+ls -lh \
+    "${VCF}" \
+    "${VCF}.tbi" \
+    "${GVCF}" \
+    "${GVCF}.tbi"
+
+
+# COMPLETION MARKERS
+
+
+touch "${SAMPLE_SCRATCH}/deepvariant.done"
+touch "${SAMPLE_SCRATCH}/deepvariant_calling.done"
+
+echo
+echo "============================================================"
+echo "DEEPVARIANT SUCCESS"
+echo "============================================================"
+echo "Sample: ${SAMPLE}"
+echo "VCF:    ${VCF}"
+echo "gVCF:   ${GVCF}"
+echo
+echo "These files are currently on scratch3."
+echo "They can be copied to home after all samples are complete."
+echo "============================================================"

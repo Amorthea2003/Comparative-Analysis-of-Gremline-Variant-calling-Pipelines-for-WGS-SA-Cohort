@@ -1,0 +1,388 @@
+#!/bin/bash
+#PBS -N DV_POP_METRICS
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -j oe
+
+set -euo pipefail
+
+module purge
+module load app/bcftools/1.19
+
+BASE="/stor6/scratch3/27777197"
+VCF="${BASE}/deepvariant_cohort/output/deepvariant_joint.vcf.gz"
+OUT="${BASE}/deepvariant_cohort/metrics_population"
+
+mkdir -p "${OUT}"
+mkdir -p "${OUT}/sample_lists"
+mkdir -p "${OUT}/subset_jvcfs"
+
+echo "========================================"
+echo "DeepVariant Population Metrics"
+echo "Started: $(date)"
+echo "========================================"
+
+
+# Verify input VCF
+
+
+if [ ! -f "${VCF}" ]; then
+    echo "ERROR: DeepVariant VCF not found:"
+    echo "${VCF}"
+    exit 1
+fi
+
+echo "Input VCF:"
+echo "${VCF}"
+
+
+# Get samples
+
+
+bcftools query -l "${VCF}" > "${OUT}/vcf_samples.txt"
+
+SAMPLE_COUNT=$(wc -l < "${OUT}/vcf_samples.txt")
+
+echo "VCF sample count: ${SAMPLE_COUNT}"
+
+if [ "${SAMPLE_COUNT}" -ne 44 ]; then
+    echo "ERROR: Expected 44 samples, found ${SAMPLE_COUNT}"
+    exit 1
+fi
+
+
+# Population sample lists
+
+
+cat > "${OUT}/sample_lists/African_3.txt" <<EOF
+899
+1025
+1042
+EOF
+
+cat > "${OUT}/sample_lists/European_2.txt" <<EOF
+1756
+1064
+EOF
+
+# SAC = all remaining 39 samples
+grep -v -E '^(899|1025|1042|1756|1064)$' \
+    "${OUT}/vcf_samples.txt" \
+    > "${OUT}/sample_lists/SAC_39.txt"
+
+
+# Validate population sizes
+
+
+AFRICAN_N=$(wc -l < "${OUT}/sample_lists/African_3.txt")
+EUROPEAN_N=$(wc -l < "${OUT}/sample_lists/European_2.txt")
+SAC_N=$(wc -l < "${OUT}/sample_lists/SAC_39.txt")
+
+echo "African samples: ${AFRICAN_N}"
+echo "European samples: ${EUROPEAN_N}"
+echo "SAC samples: ${SAC_N}"
+
+if [ "${AFRICAN_N}" -ne 3 ]; then
+    echo "ERROR: African population must contain 3 samples"
+    exit 1
+fi
+
+if [ "${EUROPEAN_N}" -ne 2 ]; then
+    echo "ERROR: European population must contain 2 samples"
+    exit 1
+fi
+
+if [ "${SAC_N}" -ne 39 ]; then
+    echo "ERROR: SAC population must contain 39 samples"
+    exit 1
+fi
+
+
+# Function
+
+
+process_population() {
+
+    NAME="$1"
+    LIST="$2"
+    N="$3"
+
+    DIR="${OUT}/${NAME}"
+
+    rm -rf "${DIR}"
+    mkdir -p "${DIR}"
+
+    echo
+    echo "========================================"
+    echo "Processing ${NAME}"
+    echo "Samples: ${N}"
+    echo "========================================"
+
+    
+    # Subset VCF
+    
+
+    bcftools view \
+        -S "${LIST}" \
+        -Oz \
+        -o "${OUT}/subset_jvcfs/${NAME}.vcf.gz" \
+        "${VCF}"
+
+    bcftools index -t \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz"
+
+    
+    # Validate VCF
+    
+
+    if bcftools view -h "${OUT}/subset_jvcfs/${NAME}.vcf.gz" >/dev/null 2>&1; then
+        echo "VCF_READABLE=YES" > "${DIR}/vcf_validation.txt"
+    else
+        echo "VCF_READABLE=NO" > "${DIR}/vcf_validation.txt"
+        exit 1
+    fi
+
+    
+    # Sample count check
+    
+
+    ACTUAL_N=$(bcftools query -l \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" | wc -l)
+
+    if [ "${ACTUAL_N}" -ne "${N}" ]; then
+        echo "ERROR: ${NAME} expected ${N} samples, found ${ACTUAL_N}"
+        exit 1
+    fi
+
+    
+    # bcftools stats
+    
+
+    bcftools stats \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" \
+        > "${DIR}/bcftools_stats.txt"
+
+    
+    # Variant counts
+    
+
+    TOTAL_VARIANTS=$(bcftools view -H \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" | wc -l)
+
+    SNP_COUNT=$(bcftools view -H -v snps \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" | wc -l)
+
+    INDEL_COUNT=$(bcftools view -H -v indels \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" | wc -l)
+
+    MULTIALLELIC_COUNT=$(bcftools view -H \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" |
+        awk '{
+            n=split($5,a,",")
+            if (n > 1) c++
+        }
+        END {print c+0}')
+
+    BIALLELIC_COUNT=$((TOTAL_VARIANTS - MULTIALLELIC_COUNT))
+
+    SNP_INDEL_RATIO=$(awk \
+        -v s="${SNP_COUNT}" \
+        -v i="${INDEL_COUNT}" \
+        'BEGIN {
+            if (i > 0) printf "%.6f", s/i;
+            else print "NA"
+        }')
+
+    MULTIALLELIC_PERCENT=$(awk \
+        -v m="${MULTIALLELIC_COUNT}" \
+        -v t="${TOTAL_VARIANTS}" \
+        'BEGIN {
+            if (t > 0) printf "%.6f", (m/t)*100;
+            else print "NA"
+        }')
+
+    
+    # Ti/Tv
+    
+
+    TSTV=$(grep '^TSTV' "${DIR}/bcftools_stats.txt" |
+        awk '{print $6}')
+
+    if [ -z "${TSTV}" ]; then
+        TSTV="NA"
+    fi
+
+    
+    # Genotype counts
+    
+
+    HOM_REF=$(bcftools query -f '[%GT\n]' \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" |
+        awk '$1=="0/0" || $1=="0|0" {n++}
+             END {print n+0}')
+
+    HET=$(bcftools query -f '[%GT\n]' \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" |
+        awk '
+        $1 ~ /^([0-9]+)[\/|]([0-9]+)$/ {
+            split($1,a,/[/|]/)
+            if (a[1] != "." && a[2] != "." && a[1] != a[2]) n++
+        }
+        END {print n+0}')
+
+    HOM_ALT=$(bcftools query -f '[%GT\n]' \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" |
+        awk '
+        $1 ~ /^([0-9]+)[\/|]([0-9]+)$/ {
+            split($1,a,/[/|]/)
+            if (a[1] == a[2] && a[1] != "0" && a[1] != ".") n++
+        }
+        END {print n+0}')
+
+    MISSING=$(bcftools query -f '[%GT\n]' \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" |
+        awk '$1=="./." || $1==".|." {n++}
+             END {print n+0}')
+
+    TOTAL_GENOTYPES=$((TOTAL_VARIANTS * N))
+
+    OTHER=$((TOTAL_GENOTYPES - HOM_REF - HET - HOM_ALT - MISSING))
+
+    MISSINGNESS=$(awk \
+        -v m="${MISSING}" \
+        -v t="${TOTAL_GENOTYPES}" \
+        'BEGIN {
+            if (t > 0) printf "%.8f", m/t;
+            else print "NA"
+        }')
+
+    HET_HOM_ALT_RATIO=$(awk \
+        -v h="${HET}" \
+        -v a="${HOM_ALT}" \
+        'BEGIN {
+            if (a > 0) printf "%.6f", h/a;
+            else print "NA"
+        }')
+
+    
+    # Write summary
+    
+
+    cat > "${DIR}/summary.tsv" <<EOF
+Metric	Value
+Population	${NAME}
+Sample_count	${N}
+Total_variants	${TOTAL_VARIANTS}
+SNPs	${SNP_COUNT}
+INDELs	${INDEL_COUNT}
+SNP_INDEL_ratio	${SNP_INDEL_RATIO}
+Multiallelic	${MULTIALLELIC_COUNT}
+Multiallelic_percent	${MULTIALLELIC_PERCENT}
+Biallelic	${BIALLELIC_COUNT}
+Ti_Tv	${TSTV}
+Total_genotypes	${TOTAL_GENOTYPES}
+Missing_genotypes	${MISSING}
+HOM_REF	${HOM_REF}
+HET	${HET}
+HOM_ALT	${HOM_ALT}
+Other_genotypes	${OTHER}
+Missingness	${MISSINGNESS}
+HET_HOM_ALT_ratio	${HET_HOM_ALT_RATIO}
+EOF
+
+    echo
+    cat "${DIR}/summary.tsv"
+
+    
+    # Additional DP / GQ / QUAL metrics
+    
+
+    bcftools query -f '[%DP\n]' \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" |
+        awk '
+        $1 != "." && $1 != "" {
+            n++
+            sum += $1
+            if ($1 >= 5) d5++
+            if ($1 >= 10) d10++
+            if ($1 >= 15) d15++
+            if ($1 >= 20) d20++
+        }
+        END {
+            print "N\t" n
+            if (n > 0) print "Mean\t" sum/n
+            print "DP>=5\t" d5+0
+            print "DP>=10\t" d10+0
+            print "DP>=15\t" d15+0
+            print "DP>=20\t" d20+0
+        }' > "${DIR}/DP_summary.tsv"
+
+    bcftools query -f '[%GQ\n]' \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" |
+        awk '
+        $1 != "." && $1 != "" {
+            n++
+            sum += $1
+            if ($1 >= 10) q10++
+            if ($1 >= 20) q20++
+            if ($1 >= 30) q30++
+            if ($1 >= 50) q50++
+        }
+        END {
+            print "N\t" n
+            if (n > 0) print "Mean\t" sum/n
+            print "GQ>=10\t" q10+0
+            print "GQ>=20\t" q20+0
+            print "GQ>=30\t" q30+0
+            print "GQ>=50\t" q50+0
+        }' > "${DIR}/GQ_summary.tsv"
+
+    bcftools query -f '%QUAL\n' \
+        "${OUT}/subset_jvcfs/${NAME}.vcf.gz" |
+        awk '
+        $1 != "." && $1 != "" {
+            n++
+            sum += $1
+            if ($1 >= 10) q10++
+            if ($1 >= 20) q20++
+            if ($1 >= 30) q30++
+            if ($1 >= 50) q50++
+            if ($1 >= 100) q100++
+        }
+        END {
+            print "N\t" n
+            if (n > 0) print "Mean\t" sum/n
+            print "QUAL>=10\t" q10+0
+            print "QUAL>=20\t" q20+0
+            print "QUAL>=30\t" q30+0
+            print "QUAL>=50\t" q50+0
+            print "QUAL>=100\t" q100+0
+        }' > "${DIR}/QUAL_summary.tsv"
+
+    echo "Completed ${NAME}"
+}
+
+
+# Run all populations
+
+
+process_population \
+    "African_3" \
+    "${OUT}/sample_lists/African_3.txt" \
+    3
+
+process_population \
+    "European_2" \
+    "${OUT}/sample_lists/European_2.txt" \
+    2
+
+process_population \
+    "SAC_39" \
+    "${OUT}/sample_lists/SAC_39.txt" \
+    39
+
+echo
+echo "========================================"
+echo "DeepVariant population metrics completed"
+echo "Finished: $(date)"
+echo "========================================"
