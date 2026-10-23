@@ -1,0 +1,27 @@
+#!/bin/bash
+
+#PBS -N create_dict
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=2:mpiprocs=2
+#PBS -e create_dict.err
+#PBS -o create_dict.out
+#PBS -M 27777197@sun.ac.za
+#PBS -m abe
+
+set -euo pipefail
+
+module purge
+module load app/gatk/4.4.0.0
+
+REFERENCE="$HOME/Variantcalling/reference/hg38.fa"
+DICT="$HOME/Variantcalling/reference/hg38.dict"
+
+echo "Creating sequence dictionary..."
+echo "Reference: ${REFERENCE}"
+echo "Output: ${DICT}"
+
+gatk CreateSequenceDictionary \
+    -R "${REFERENCE}" \
+    -O "${DICT}"
+
+echo "Sequence dictionary created successfully."

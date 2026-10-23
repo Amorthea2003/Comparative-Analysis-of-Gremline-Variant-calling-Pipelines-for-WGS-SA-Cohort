@@ -1,0 +1,66 @@
+#!/bin/bash
+#PBS -N dragmap_ref
+#PBS -l nodes=1:ppn=16
+#PBS -l mem=64gb
+#PBS -l walltime=48:00:00
+#PBS -o dragmap_ref.out
+#PBS -e dragmap_ref.err
+
+set -euo pipefail
+
+module load app/dragmap/1.3.0
+
+REFERENCE="${HOME}/Variantcalling/reference/hg38.fa"
+REF_DIR="/stor6/scratch3/27777197/dragen_gatk/reference"
+
+echo "=========================================="
+echo "DRAGMAP reference/hash build"
+echo "=========================================="
+echo "Host: $(hostname)"
+echo "Date: $(date)"
+echo "dragen-os: $(which dragen-os)"
+echo "Reference: ${REFERENCE}"
+echo "Output: ${REF_DIR}"
+echo "=========================================="
+
+# Check reference exists
+if [[ ! -s "${REFERENCE}" ]]; then
+    echo "ERROR: Reference not found: ${REFERENCE}"
+    exit 1
+fi
+
+# Check scratch is writable
+if [[ ! -d "${REF_DIR}" ]]; then
+    mkdir -p "${REF_DIR}"
+fi
+
+if [[ ! -w "${REF_DIR}" ]]; then
+    echo "ERROR: Cannot write to ${REF_DIR}"
+    exit 1
+fi
+
+echo "Reference size:"
+ls -lh "${REFERENCE}"
+
+echo
+echo "Starting DRAGMAP hash build..."
+date
+
+dragen-os \
+    --build-hash-table true \
+    --ht-reference "${REFERENCE}" \
+    --output-directory "${REF_DIR}" \
+    --ht-num-threads 16
+
+echo
+echo "DRAGMAP hash build finished."
+date
+
+echo
+echo "Hash directory contents:"
+ls -lh "${REF_DIR}"
+
+echo
+echo "=========================================="
+echo "REFERENCE BUILD SUCCESSFUL"
+echo "=========================================="
