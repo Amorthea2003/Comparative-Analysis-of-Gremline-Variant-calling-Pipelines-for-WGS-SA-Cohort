@@ -97,4 +97,4 @@ Scholtz, A. 2026. Concordance Analysis of Gremline Variant calling Pipelines for
 
 ## Licence
 
-
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
