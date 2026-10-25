@@ -85,6 +85,12 @@ Rscript R/caller_class_tests.R
 
 Scholtz, A. 2026. Concordance Analysis of Gremline Variant calling Pipelines for WGS SA Cohort. BSc Honours Bioinformatics and Computational Biology, Stellenbosch University
 
+## URLs
+
+[![TB Host Genetics](https://img.shields.io/badge/Division-TB%20Host%20Genetics-8a2be2.svg)](https://github.com/TBHostGenetics)
+[![Stellenbosch University](https://img.shields.io/badge/Institution-Stellenbosch%20University-003366.svg)](https://www.sun.ac.za)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 ## Contact
 
 27777197@sun.ac.za. Supervisor: 
