@@ -1,0 +1,15 @@
+# Bioinformatics & Variant Calling Pipeline Outputs
+*.bam
+*.bai
+*.cram
+*.crai
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.vcf.gz
+*.vcf.gz.tbi
+*.bed.gz
+work/
+.nextflow/
+.nextflow.log*
