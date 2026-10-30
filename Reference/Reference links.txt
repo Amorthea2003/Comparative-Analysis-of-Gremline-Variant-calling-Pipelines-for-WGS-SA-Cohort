@@ -1,0 +1,11 @@
+Links to download
+
+Reference genome (hg38)
+
+https://hgdownload.soe.ucsc.edu/goldenpath/hg38/bigZips/
+https://hgdownload.soe.ucsc.edu/goldenpath/hg38/bigZips/hg38.fa.gz
+
+dbSNP
+
+gsutil cp gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.gz .
+gsutil cp gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.gz.tbi .
